@@ -1,0 +1,34 @@
+# --- Infrastructure as Code: Two Services with Individual Disks ---
+
+services:
+  # --- Service 1: The Simulator (Flask App) ---
+  - type: web
+    name: simulator-flask-app
+    runtime: docker
+    # This service will get URL 1
+    startCommand: "gunicorn --bind 0.0.0.0:8000 --workers 4 app:app"
+    envVars:
+      - key: PORT
+        value: 8000
+    
+    # --- ADDED: Disk 1 for Flask App (Cannot be shared) ---
+    disks:
+      - name: flask-data-disk       # Unique Name 1
+        mountPath: /shared-data     # The disk appears at this folder path
+        sizeGB: 1                   # Smallest size: 1 GB
+        
+  # --- Service 2: The Viewer (Streamlit App) ---
+  - type: web
+    name: viewer-streamlit-app
+    runtime: docker
+    # This service will get URL 2
+    startCommand: "streamlit run dashboard.py --server.port 8501 --server.enableCORS false --server.enableXsrfProtection false"
+    envVars:
+      - key: PORT
+        value: 8501
+      
+    # --- ADDED: Disk 2 for Streamlit App (Cannot read Disk 1) ---
+    disks:
+      - name: streamlit-data-disk    # Unique Name 2
+        mountPath: /shared-data      # The disk appears at this folder path
+        sizeGB: 1

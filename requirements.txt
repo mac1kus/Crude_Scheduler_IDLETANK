@@ -1,11 +1,13 @@
+--only-binary=:all:
+setuptools
+wheel
 Flask
 gunicorn
 openpyxl
 xlrd
 requests
-numpy==1.24.3
+numpy==2.3.4
 streamlit
 pandas
 plotly
 python-dotenv
-    

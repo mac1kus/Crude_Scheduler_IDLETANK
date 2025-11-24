@@ -7,6 +7,7 @@ import copy
 from solver import optimize_crude_mix_schedule
 from collections import defaultdict
 import re
+import json
 
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -18,6 +19,7 @@ from scheduler import Simulator
 # --- User Authentication ---
 APP_USERNAME = os.environ.get("APP_USERNAME", "admin")
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "admin123")
+DATA_FILE = 'data.json'
 
 
 # --- Helper Functions for Parameter Validation ---
@@ -298,17 +300,21 @@ def _create_simulation_log_sheet(wb, results):
         return False
 
 def _create_daily_summary_sheet(wb, results):
-    """Create Sheet 2: Daily summary with enhanced tank status columns"""
+    """
+    Create Sheet 2: Daily summary with robust Log parsing.
+    Fixes issue where regex grabbed tank volumes instead of processed total,
+    or returned zero when the log event type wasn't strictly 'PROCESSING'.
+    """
     try:
         from openpyxl.styles import Font, Alignment, PatternFill
         from openpyxl.utils import get_column_letter
         import re
+        from datetime import datetime
         
         ws = wb.create_sheet("daily_summary_sheet")
         
         simulation_data = results.get('simulation_data', [])
         simulation_log = results.get('simulation_log', [])
-        parameters = results.get('parameters', {})
         
         if not simulation_data:
             return False
@@ -316,14 +322,12 @@ def _create_daily_summary_sheet(wb, results):
         timestamp_str = datetime.now().strftime('%d/%m/%y %H:%M')
         ws.cell(row=1, column=1, value=timestamp_str)
         ws.cell(row=1, column=1).font = Font(bold=True, size=12)
-        ws.merge_cells('A1:N1') # <-- MODIFIED MERGE
+        ws.merge_cells('A1:N1')
         
-        # --- START MODIFICATION ---
         base_headers = ['DAY', 'Date', 'Opening Stock (bbl)', 'Certified (bbl)', 'Uncertified (bbl)',
                        'Processing (bbl)', 'Closing Stock (bbl)', 'Tank Util %',
                        'Ready Tanks', 'Empty Tanks', 'FILLING', 'LAB', 'FEEDING', 
                        'SUSPENDED', 'TOTAL']
-        # --- END MODIFICATION ---
         
         num_tanks = sum(1 for key in simulation_data[0].keys() 
                       if key.startswith('Tank') and len(key) <= 6)
@@ -337,27 +341,72 @@ def _create_daily_summary_sheet(wb, results):
             cell.fill = header_fill
             cell.alignment = Alignment(horizontal='center', vertical='center')
         
+        # --- Helper: Robust Date Parsing for Comparison ---
+        def get_date_obj(date_val):
+            if not date_val: return None
+            date_str = str(date_val).split(' ')[0].strip() # Remove time
+            for fmt in ('%d/%m/%Y', '%d/%m/%y', '%Y-%m-%d', '%d-%m-%Y'):
+                try:
+                    return datetime.strptime(date_str, fmt).date()
+                except ValueError:
+                    continue
+            return None
+
         for row_idx, row_data in enumerate(simulation_data, 3):
             day_number = row_idx - 2
             date_str = row_data.get('date', '')
+            row_date_obj = get_date_obj(date_str)
+            
             opening_stock = row_data.get('start_inventory', 0)
             closing_stock = row_data.get('end_inventory', 0)
-            processing = row_data.get('processing', 0)
             certified_stock = row_data.get('certified_stock', 0)
             tank_utilization = row_data.get('tank_utilization', 0)
-            
             uncertified_stock = max(0, opening_stock - certified_stock)
             
-            # Find DAILY_STATUS event from simulation_log for this date to get tank statuses
-            current_date = date_str.split(' ')[0] if date_str else ""
-            tank_statuses_from_log = {}
+            # --- FIX: Calculate Processing DIRECTLY from Log Message ---
+            # Target message: "Day ends with ... Processed: 450,000 bbl"
+            calculated_processing = 0.0
+            found_processing_log = False
             
-            if simulation_log and current_date:
+            if simulation_log and row_date_obj:
+                for log in simulation_log:
+                    log_date_obj = get_date_obj(log.get('Timestamp', ''))
+                    
+                    # Match Date
+                    if log_date_obj == row_date_obj:
+                        message = log.get('Message', '')
+                        
+                        # Regex to find "Processed:" value specifically.
+                        # Matches "Processed: 450,000" or "Processed 450,000"
+                        # It ignores earlier numbers in the string (like "Tank 3: 418,500").
+                        match = re.search(r'Processed[:\s]+\s*([0-9,]+(\.\d+)?)', message, re.IGNORECASE)
+                        
+                        if match:
+                            found_processing_log = True
+                            try:
+                                vol_str = match.group(1).replace(',', '')
+                                # If we found a specific "Processed:" summary, use that value directly
+                                # This assumes one daily summary line per day.
+                                current_val = float(vol_str)
+                                
+                                # If multiple lines have "Processed:", we take the largest one (likely the daily total)
+                                # or overwrite, assuming the daily summary is the definitive one.
+                                if current_val > calculated_processing:
+                                    calculated_processing = current_val
+                            except ValueError:
+                                pass
+            
+            processing = calculated_processing
+            # --- END FIX ---
+            
+            # Find Tank Statuses for this day
+            tank_statuses_from_log = {}
+            if simulation_log and row_date_obj:
                 daily_status_log = None
                 for log in simulation_log:
                     if log.get('Event') == 'DAILY_STATUS':
-                        log_date = log.get('Timestamp', '').split(' ')[0]
-                        if log_date == current_date:
+                        log_date_obj = get_date_obj(log.get('Timestamp', ''))
+                        if log_date_obj == row_date_obj:
                             daily_status_log = log
                             break
                 
@@ -366,54 +415,34 @@ def _create_daily_summary_sheet(wb, results):
                         tank_key = f'Tank{tank_num}'
                         tank_statuses_from_log[tank_key] = daily_status_log.get(tank_key, '')
             
-            # --- START MODIFICATION ---
-            # Count tank statuses from simulation_log
+            # Count tank statuses
             ready_tanks_count = sum(1 for t in tank_statuses_from_log.values() if t == 'READY')
             empty_tanks_count = sum(1 for t in tank_statuses_from_log.values() if t == 'EMPTY')
             filling_count = sum(1 for t in tank_statuses_from_log.values() if t in ['FILLING', 'FILLED'])
             lab_count = sum(1 for t in tank_statuses_from_log.values() if t in ['LAB', 'SETTLING'])
             feeding_count = sum(1 for t in tank_statuses_from_log.values() if t == 'FEEDING')
-            suspended_count = sum(1 for t in tank_statuses_from_log.values() if t == 'SUSPENDED') # <-- ADDED COUNT
+            suspended_count = sum(1 for t in tank_statuses_from_log.values() if t == 'SUSPENDED')
             total_count = (ready_tanks_count + empty_tanks_count + filling_count + 
-                           lab_count + feeding_count + suspended_count) # <-- UPDATED TOTAL
-            # --- END MODIFICATION ---
+                           lab_count + feeding_count + suspended_count)
             
             col_idx = 1
             for header in base_headers:
-                if header == 'DAY':
-                    value = day_number
-                elif header == 'Date':
-                    value = date_str
-                elif header == 'Opening Stock (bbl)':
-                    value = opening_stock
-                elif header == 'Certified (bbl)':
-                    value = certified_stock
-                elif header == 'Uncertified (bbl)':
-                    value = uncertified_stock
-                elif header == 'Processing (bbl)':
-                    value = processing
-                elif header == 'Closing Stock (bbl)':
-                    value = closing_stock
-                elif header == 'Tank Util %':
-                    value = tank_utilization
-                elif header == 'Ready Tanks':
-                    value = ready_tanks_count
-                elif header == 'Empty Tanks':
-                    value = empty_tanks_count
-                elif header == 'FILLING':
-                    value = filling_count
-                elif header == 'LAB':
-                    value = lab_count
-                elif header == 'FEEDING':
-                    value = feeding_count
-                # --- START MODIFICATION ---
-                elif header == 'SUSPENDED':
-                    value = suspended_count
-                # --- END MODIFICATION ---
-                elif header == 'TOTAL':
-                    value = total_count
-                else:
-                    value = ''
+                value = ''
+                if header == 'DAY': value = day_number
+                elif header == 'Date': value = date_str
+                elif header == 'Opening Stock (bbl)': value = opening_stock
+                elif header == 'Certified (bbl)': value = certified_stock
+                elif header == 'Uncertified (bbl)': value = uncertified_stock
+                elif header == 'Processing (bbl)': value = processing # USES LOG VALUE
+                elif header == 'Closing Stock (bbl)': value = closing_stock
+                elif header == 'Tank Util %': value = tank_utilization
+                elif header == 'Ready Tanks': value = ready_tanks_count
+                elif header == 'Empty Tanks': value = empty_tanks_count
+                elif header == 'FILLING': value = filling_count
+                elif header == 'LAB': value = lab_count
+                elif header == 'FEEDING': value = feeding_count
+                elif header == 'SUSPENDED': value = suspended_count
+                elif header == 'TOTAL': value = total_count
                 
                 cell = ws.cell(row=row_idx, column=col_idx, value=value)
                 
@@ -421,12 +450,10 @@ def _create_daily_summary_sheet(wb, results):
                     cell.alignment = Alignment(horizontal='left')
                 elif header == 'Tank Util %':
                     cell.alignment = Alignment(horizontal='right')
-                    if value:
-                        cell.number_format = '0.0"%"'
+                    if value: cell.number_format = '0.0"%"'
                 elif isinstance(value, (int, float)):
                     cell.alignment = Alignment(horizontal='right')
-                    if value >= 1000:
-                        cell.number_format = '#,##0'
+                    if value >= 1000: cell.number_format = '#,##0'
                 else:
                     cell.alignment = Alignment(horizontal='center')
                 
@@ -438,40 +465,23 @@ def _create_daily_summary_sheet(wb, results):
                 cell = ws.cell(row=row_idx, column=col_idx, value=tank_state)
                 cell.alignment = Alignment(horizontal='center')
                 
-                # --- START COLOR CHANGE ---
-                if tank_state == 'READY':
-                    # Light Green
-                    cell.fill = PatternFill(start_color='C6EFCE', end_color='C6EFCE', fill_type='solid')
-                elif tank_state == 'EMPTY':
-                    # Pure Red
-                    cell.fill = PatternFill(start_color='FF0000', end_color='FF0000', fill_type='solid')
-                elif tank_state == 'SUSPENDED':
-                    # Light Red
-                    cell.fill = PatternFill(start_color='FFC7CE', end_color='FFC7CE', fill_type='solid')
-                elif tank_state == 'FEEDING':
-                    # Yellow
-                    cell.fill = PatternFill(start_color='FFEB9C', end_color='FFEB9C', fill_type='solid')
-                elif tank_state in ['FILLING', 'FILLED']:
-                    # Light Blue
-                    cell.fill = PatternFill(start_color='BDD7EE', end_color='BDD7EE', fill_type='solid')
-                elif tank_state in ['LAB', 'SETTLING']:
-                    # Light Olive
-                    cell.fill = PatternFill(start_color='E2EFDA', end_color='E2EFDA', fill_type='solid')
-                # --- END COLOR CHANGE ---
+                if tank_state == 'READY': cell.fill = PatternFill(start_color='C6EFCE', end_color='C6EFCE', fill_type='solid')
+                elif tank_state == 'EMPTY': cell.fill = PatternFill(start_color='FF0000', end_color='FF0000', fill_type='solid')
+                elif tank_state == 'SUSPENDED': cell.fill = PatternFill(start_color='FFC7CE', end_color='FFC7CE', fill_type='solid')
+                elif tank_state == 'FEEDING': cell.fill = PatternFill(start_color='FFEB9C', end_color='FFEB9C', fill_type='solid')
+                elif tank_state in ['FILLING', 'FILLED']: cell.fill = PatternFill(start_color='BDD7EE', end_color='BDD7EE', fill_type='solid')
+                elif tank_state in ['LAB', 'SETTLING']: cell.fill = PatternFill(start_color='E2EFDA', end_color='E2EFDA', fill_type='solid')
                 
                 col_idx += 1
         
+        # Auto-fit columns
         for col_idx in range(1, len(headers) + 1):
             max_length = 0
             column_letter = get_column_letter(col_idx)
-            
             for cell in ws[column_letter]:
                 try:
-                    if cell.value is not None:
-                        max_length = max(max_length, len(str(cell.value)))
-                except:
-                    pass
-            
+                    if cell.value is not None: max_length = max(max_length, len(str(cell.value)))
+                except: pass
             adjusted_width = min(max(max_length + 3, 12), 50)
             ws.column_dimensions[column_letter].width = adjusted_width
         
@@ -810,14 +820,24 @@ def _create_sequence_summary_sheets(wb, results):
         timestamp_str = f"Report Generated On: {datetime.now().strftime('%d-%b-%Y %H:%M:%S')}"
         ws.cell(row=1, column=1, value=timestamp_str).font = Font(bold=True, italic=True, color="4F4F4F")
 
+        # --- START OF MODIFICATION 1: Force integer keys for the map ---
         tank_details = results.get('full_tank_details', [])
-        tank_name_map = {tank.get('id'): (tank.get('display_name') or f"Tank {tank.get('id')}") for tank in tank_details if tank.get('id')}
+        tank_name_map = {}
+        for tank in tank_details:
+            try:
+                # Force the ID from JSON (which could be str or int) to be an int key
+                tank_int_id = int(tank.get('id'))
+                display_name = tank.get('display_name') or f"Tank {tank_int_id}"
+                tank_name_map[tank_int_id] = display_name
+            except (ValueError, TypeError):
+                continue # Skip if ID is invalid
+        # --- END OF MODIFICATION 1 ---
 
         cargo_report = results.get('cargo_report', []) or []
         feeding_events_log = results.get('feeding_events_log', []) or []
         simulation_log = results.get('simulation_log', []) or [] # Get the simulation log
 
-        # --- START FIX: Extract mix from the READY log, not from daily_discharge_log ---
+        # --- Extract mix from the READY log ---
         tank_mix_map = {} # This will store { (tank_id, cycle_num): "Mix String" }
         
         for entry in simulation_log:
@@ -838,13 +858,12 @@ def _create_sequence_summary_sheets(wb, results):
                     continue
 
                 # Extract the mix string from the message
-                # Message format: "Tank 14 now READY - Mix: [Bonny Light: 50.0%, ...]"
                 mix_match = re.search(r'Mix:\s*\[(.*?)\]', message)
                 if mix_match:
                     mix_string = mix_match.group(1).strip()
                     # Store the mix string against the tank and its specific cycle
                     tank_mix_map[(tank_id, cycle_num)] = mix_string
-        # --- END FIX ---
+        # --- END Extract mix ---
 
         # --- Call the function to build structured cycle data ---
         cycles_data = _build_cycle_data_from_log(simulation_log)
@@ -867,7 +886,7 @@ def _create_sequence_summary_sheets(wb, results):
              current_row += 1
         current_row += 2
 
-        # --- FEEDING SEQUENCE Table (Remains the same) ---
+        # --- FEEDING SEQUENCE Table ---
         ws.cell(row=current_row, column=1, value="FEEDING SEQUENCE").font = Font(bold=True, size=14)
         current_row += 2
         feeding_headers = ['TANK', 'START_DATE', 'START_TIME', 'END_DATE', 'END_TIME']
@@ -881,13 +900,28 @@ def _create_sequence_summary_sheets(wb, results):
         for event in sorted_feeding_log:
              start_dt = _parse_log_dt(event.get('start'))
              end_dt = _parse_log_dt(event.get('end'))
-             tank_id = event.get('tank_id')
-             row_data = [ tank_name_map.get(tank_id, f"Tank {tank_id}"), start_dt.strftime('%d/%m/%y') if start_dt else '', start_dt.strftime('%H:%M') if start_dt else '', end_dt.strftime('%d/%m/%y') if end_dt else 'N/A', end_dt.strftime('%H:%M') if end_dt else 'N/A' ]
+             
+             # --- START OF MODIFICATION 2: Force integer lookup for tank_id ---
+             tank_id_from_log = event.get('tank_id')
+             try:
+                 # Force the ID from JSON (which could be str or int) to be an int
+                 tank_id = int(tank_id_from_log)
+             except (ValueError, TypeError):
+                 continue # Skip this invalid log entry
+             # --- END OF MODIFICATION 2 ---
+             
+             row_data = [ 
+                 tank_name_map.get(tank_id, f"Tank {tank_id}"), # Now this is int.get(int)
+                 start_dt.strftime('%d/%m/%y') if start_dt else '', 
+                 start_dt.strftime('%H:%M') if start_dt else '', 
+                 end_dt.strftime('%d/%m/%y') if end_dt else 'N/A', 
+                 end_dt.strftime('%H:%M') if end_dt else 'N/A' 
+             ]
              for col, value in enumerate(row_data, 1): ws.cell(row=current_row, column=col, value=value).alignment = Alignment(horizontal='center')
              current_row += 1
         current_row += 2
 
-        # --- FILLING, SETTLING & LAB TESTING SEQUENCE Table (Uses new cycles_data with chronological sort) ---
+        # --- FILLING, SETTLING & LAB TESTING SEQUENCE Table ---
         ws.cell(row=current_row, column=1, value="FILLING, SETTLING & LAB TESTING SEQUENCE").font = Font(bold=True, size=14)
         current_row += 2
         
@@ -945,9 +979,8 @@ def _create_sequence_summary_sheets(wb, results):
             # Get the mix string for this specific tank_id AND cycle_num
             mix_string_for_cycle = tank_mix_map.get((tank_id, cycle_num), 'N/A') 
             
-            # --- START FIX: Corrected the row_data list ---
             row_data = [
-                tank_name_map.get(tank_id, f"Tank {tank_id}"),
+                tank_name_map.get(tank_id, f"Tank {tank_id}"), # This lookup uses an int key
                 mix_string_for_cycle,
                 fill_start.strftime('%d/%m/%y') if fill_start else '',
                 fill_start.strftime('%H:%M') if fill_start else '',
@@ -959,9 +992,8 @@ def _create_sequence_summary_sheets(wb, results):
                 lab_start.strftime('%H:%M') if lab_start else '',
                 ready_time.strftime('%d/%m/%y') if ready_time else '',
                 ready_time.strftime('%H:%M') if ready_time else '',
-                tank_ready_time_str  # <--- This is the correct final value
+                tank_ready_time_str
             ]
-            # --- END FIX ---
             
             for col, value in enumerate(row_data, 1):
                 ws.cell(row=current_row, column=col, value=value).alignment = Alignment(horizontal='center')
@@ -1173,6 +1205,7 @@ def _create_tank_cargo_filling_sheet(wb, results):
         import traceback
         traceback.print_exc()
         return False
+
 def _create_tank_filling_volumes_sheet(wb, results):
     """Create the Tank Filling Volumes sheet"""
     try:
@@ -1180,7 +1213,19 @@ def _create_tank_filling_volumes_sheet(wb, results):
 
         daily_discharge_log = results.get('daily_discharge_log', [])
         
-        # DEBUG
+        # --- START OF FIX: Add the tank name map ---
+        # This is the same logic from _create_sequence_summary_sheets
+        tank_details = results.get('full_tank_details', [])
+        tank_name_map = {}
+        for tank in tank_details:
+            try:
+                # Force the ID from JSON (which could be str or int) to be an int key
+                tank_int_id = int(tank.get('id'))
+                display_name = tank.get('display_name') or f"Tank {tank_int_id}"
+                tank_name_map[tank_int_id] = display_name
+            except (ValueError, TypeError):
+                continue # Skip if ID is invalid
+        # --- END OF FIX ---
         
         current_row = 1
         ws.cell(row=current_row, column=1, value="DAILY CARGO DISCHARGE").font = Font(bold=True, size=14)
@@ -1201,11 +1246,18 @@ def _create_tank_filling_volumes_sheet(wb, results):
     
         consolidated_data = {}
         for entry in daily_discharge_log:
+            # --- START OF FIX: Ensure tank_id is an integer for lookup ---
+            try:
+                entry_tank_id = int(entry.get('tank_id', 0))
+            except (ValueError, TypeError):
+                entry_tank_id = 0
+            # --- END OF FIX ---
+
             key = (
                 entry.get('date', 'Unknown'), 
                 entry.get('cargo_type', 'Unknown'),
                 entry.get('crude_type', 'N/A'), 
-                entry.get('tank_id', 0)
+                entry_tank_id # Use the cleaned integer ID
             )
             if key not in consolidated_data:
                 consolidated_data[key] = 0
@@ -1215,7 +1267,7 @@ def _create_tank_filling_volumes_sheet(wb, results):
         for (date, cargo_type, crude_type, tank_id), volume in consolidated_data.items():
             report_events.append({
                 'date': date, 'cargo_type': cargo_type,
-                'crude_type': crude_type, 'tank_id': tank_id,
+                'crude_type': crude_type, 'tank_id': tank_id, # tank_id is already an int
                 'volume_filled': volume
             })
             
@@ -1236,8 +1288,10 @@ def _create_tank_filling_volumes_sheet(wb, results):
         operation_subtotal = 0
     
         while current_event:
+            # --- START OF FIX: Look up the custom display name ---
             tank_id = current_event['tank_id']
-            tank_display_name = f"Tank {tank_id}"
+            tank_display_name = tank_name_map.get(tank_id, f"Tank {tank_id}")
+            # --- END OF FIX ---
         
             operation_subtotal += current_event['volume_filled']
         
@@ -1249,7 +1303,9 @@ def _create_tank_filling_volumes_sheet(wb, results):
             discharge_cell.number_format = '#,##0'
             discharge_cell.alignment = Alignment(horizontal='center')
 
+            # --- START OF FIX: Use the looked-up name ---
             ws.cell(row=current_row, column=5, value=tank_display_name).alignment = Alignment(horizontal='center')
+            # --- END OF FIX ---
 
             vol_filled_cell = ws.cell(row=current_row, column=6, value=operation_subtotal)
             vol_filled_cell.number_format = '#,##0'
@@ -1263,7 +1319,9 @@ def _create_tank_filling_volumes_sheet(wb, results):
                 operation_ended = True
 
             if operation_ended:
+                # --- START OF FIX: Use the looked-up name in the subtotal ---
                 subtotal_cell = ws.cell(row=current_row, column=5, value=f"Subtotal {tank_display_name}")
+                # --- END OF FIX ---
                 subtotal_cell.font = Font(bold=True)
                 subtotal_cell.alignment = Alignment(horizontal='right')
             
@@ -1308,7 +1366,6 @@ def _create_tank_filling_volumes_sheet(wb, results):
         traceback.print_exc()
         return False
 
-
 def register_routes(app):
     """Register all routes with the Flask app"""
     
@@ -1337,7 +1394,7 @@ def register_routes(app):
     def index():
         """Displays the main scheduler page."""
         return render_template('index.html')
-
+    
     @app.route('/api/simulate', methods=['POST'])
     def simulate():
         """
@@ -1365,37 +1422,81 @@ def register_routes(app):
                 params['solver_results'] = solver_results
             
             # --- PREPARE SIMULATOR CONFIG (CFG) ---
-            # This block is the same as your old routes1.py, it prepares the data.
             try:
                 # Calculate Usable Volume
-                unusable_part = safe_float(params.get('defaultDeadBottom', 10000), 10000, 'defaultDeadBottom') + \
+                unusable_part = safe_float(params.get('deadBottom1', 10000), 10000, 'deadBottom1') + \
                                (safe_float(params.get('bufferVolume', 500), 500, 'bufferVolume') / 2.0)
                 usable_volume = safe_float(params.get('tankCapacity', 600000), 600000, 'tankCapacity') - unusable_part
 
-                initial_tank_levels = {}
-                num_tanks = safe_int(params.get('numTanks'), param_name='numTanks')
+                # --- START REPLACEMENT FIX ---
 
-                # Add validation for number of tanks
-                if num_tanks <= 0:
+                # 1. Get the 'numTanks' value from the UI (e.g., 14)
+                num_tanks_ui = safe_int(params.get('numTanks'), param_name='numTanks')
+                if num_tanks_ui <= 0:
                     return jsonify({'success': False, 'error': 'Number of tanks must be greater than zero.'}), 400
-
-                for i in range(1, num_tanks + 1):
-                    tank_level = safe_float(params.get(f'tank{i}Level', usable_volume), usable_volume, f'tank{i}Level')
+                
+                num_filled = safe_int(params.get('numFilledTanks', 0), 0, 'numFilledTanks')
+                
+                # 2. Find the true maximum tank ID by checking all possible keys
+                max_tank_id = num_tanks_ui # Start with the UI count
+                
+                # Check all param keys (e.g., tank1Level, tank25Name)
+                for key in params.keys():
+                    if key.startswith('tank'):
+                        try:
+                            # Extract the first number found in the key
+                            match = re.search(r'\d+', key)
+                            if match:
+                                tank_num = int(match.group(0))
+                                if tank_num > max_tank_id:
+                                    max_tank_id = tank_num
+                        except ValueError:
+                            continue
+                
+                # Check idleTankData (e.g., [{ 'sequentialId': '25' }])
+                idle_tank_data = params.get('idleTankData', [])
+                for item in idle_tank_data:
+                    try:
+                        tank_num = int(item.get('sequentialId'))
+                        if tank_num > max_tank_id:
+                            max_tank_id = tank_num
+                    except (ValueError, TypeError):
+                        continue
+                
+                # We now have num_tanks_ui (e.g., 14) and max_tank_id (e.g., 25)
+                
+                # 3. Create initial levels and name map *only* for tanks up to the max_tank_id
+                initial_tank_levels = {}
+                tank_name_map = {}
+                
+                for i in range(1, max_tank_id + 1):
+                    # Get the level for this tank
+                    # Default level is FULL if it's in the FILLED range (1-12)
+                    default_level = usable_volume if i <= num_filled else 0 
+                    tank_level = safe_float(params.get(f'tank{i}Level', default_level), default_level, f'tank{i}Level')
                     initial_tank_levels[i] = tank_level
+                    
+                    # Get the name for this tank
+                    tank_name_map[i] = params.get(f'tank{i}Name', f'Tank {i}')
 
                 # Prepare the configuration dictionary for the Simulator
                 cfg = {
                     "processing_rate": safe_float(params.get('processingRate'), param_name='processingRate'),
-                    "num_tanks": num_tanks,
+                    
+                    # --- THIS IS THE KEY CHANGE ---
+                    "num_tanks": max_tank_id,       # e.g., 25 (The maximum ID for report columns)
+                    "num_tanks_ui": num_tanks_ui,  # e.g., 14 (The "real" number of tanks from the UI)
+                    # --- END KEY CHANGE ---
+
                     "initial_tank_levels": initial_tank_levels,
                     "start_dt": datetime.strptime(params['crudeProcessingDate'], "%Y-%m-%dT%H:%M"),
                     "usable_per_tank": usable_volume,
                     "settling_days": safe_float(params.get('settlingTime'), param_name='settlingTime'),
                     "lab_hours": safe_float(params.get('labTestingDays', 0), param_name='labTestingDays') * 24.0,
                     "discharge_rate": safe_float(params.get('pumpingRate'), param_name='pumpingRate'),
-                    "dead_bottom": safe_float(params.get('defaultDeadBottom', 10000), 10000, 'defaultDeadBottom'),
+                    "dead_bottom": safe_float(params.get('deadBottom1', 10000), 10000, 'deadBottom1'),
                     "buffer_volume": safe_float(params.get('bufferVolume', 500), 500, 'bufferVolume'),
-                    "min_ready_tanks": safe_int(params.get('minReadyTanks', 2), 2, 'minReadyTanks'),
+                    "min_ready_tanks": safe_int(params.get('minReadyTanks', 4), 4, 'minReadyTanks'),
                     "first_cargo_min_ready": safe_int(params.get('firstCargoMinReady', 8), 8, 'firstCargoMinReady'),
                     "first_cargo_max_ready": safe_int(params.get('firstCargoMaxReady', 9), 9, 'firstCargoMaxReady'),
                     "tank_gap_hours": safe_float(params.get('tankGapHours', 0.0), 0.0, 'tankGapHours'),
@@ -1403,8 +1504,12 @@ def register_routes(app):
                     "berth_gap_hours_max": safe_float(params.get('berth_gap_hours_max', 0), 0, 'berth_gap_hours_max'),
                     "preDischargeDays": safe_float(params.get('preDischargeDays', 0), param_name='preDischargeDays'),
                     "tankFillGapHours": safe_float(params.get('tankFillGapHours', 0.0), 0.0, 'tankFillGapHours'),
+                    "scheduling_mode": params.get('departureMode', 'solver'),
+                    "manual_arrival_b1": params.get('manualArrivalBerth1'),
+                    "manual_arrival_b2": params.get('manualArrivalBerth2'),
                     "horizon_days": safe_float(params.get('schedulingWindow'), param_name='schedulingWindow'),
                     "snapshot_interval_minutes": safe_int(params.get('snapshotIntervalMinutes', 30), 30, 'snapshotIntervalMinutes'),
+                    
                     "cargo_defs": {
                         "VLCC": safe_float(params.get('vlccCapacity', 0), 0, 'vlccCapacity'),
                         "SUEZ": safe_float(params.get('suezmaxCapacity', 0), 0, 'suezmaxCapacity'),
@@ -1413,7 +1518,9 @@ def register_routes(app):
                         "HANDY": safe_float(params.get('handymaxCapacity', 0), 0, 'handymaxCapacity'),
                     },
                     "use_optimized_schedule": params.get('use_optimized_schedule', False),
-                    "solver_results": params.get('solver_results', None)
+                    "solver_results": params.get('solver_results', None),
+                    "tank_name_map": tank_name_map,
+                    "idle_tank_data": idle_tank_data
                 }
 
             except (KeyError, ValueError) as e:
@@ -1430,19 +1537,15 @@ def register_routes(app):
             sim.daily_log_rows.sort(key=lambda x: datetime.strptime(x["Timestamp"], "%d/%m/%Y %H:%M"))
             sim.save_csvs()
             
-            # Get ALL CSV files created by save_csvs() - using broader pattern
             import glob
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             
-            # Try multiple patterns to catch all CSV files
             csv_files = []
             
-            # Pattern 1: Files with timestamp
             csv_files.extend(glob.glob(f"/tmp/*_{timestamp}.csv"))
             
-            # Pattern 2: Common CSV filenames (in case timestamp format differs)
             csv_patterns = [
-                "/tmp/tank_snap_shots*.csv",
+                "/tmp/tank_snapshots*.csv",
                 "/tmp/simulation_log*.csv", 
                 "/tmp/daily_summary*.csv",
                 "/tmp/cargo_report*.csv"
@@ -1450,7 +1553,6 @@ def register_routes(app):
             
             for pattern in csv_patterns:
                 matching_files = glob.glob(pattern)
-                # Add only files modified in last 10 seconds (recently created)
                 import time
                 current_time = time.time()
                 for f in matching_files:
@@ -1471,6 +1573,14 @@ def register_routes(app):
                     day_num = (datetime.strptime(log_entry['Timestamp'], "%d/%m/%Y %H:%M") - cfg['start_dt']).days + 1
                     alerts.append({"day": day_num, "type": log_entry.get("Level").lower(), "message": log_entry.get("Message")})
 
+            full_tank_details_list = []
+            if "tank_name_map" in cfg:
+                for tank_id, display_name in cfg["tank_name_map"].items():
+                    full_tank_details_list.append({
+                        "id": tank_id,
+                        "display_name": display_name
+                    })
+
             return jsonify({
                 'success': True,
                 'csv_files': csv_download_urls,
@@ -1481,7 +1591,8 @@ def register_routes(app):
                 'simulation_data': sim.daily_summary_rows,
                 'feeding_events_log': sim.feeding_events_log, 
                 'filling_events_log': sim.filling_events_log, 
-                'daily_discharge_log': sim.daily_discharge_log 
+                'daily_discharge_log': sim.daily_discharge_log,
+                'full_tank_details': full_tank_details_list
             })
 
         except Exception as e:
@@ -1660,13 +1771,70 @@ def register_routes(app):
 
     @app.route('/api/save_inputs', methods=['POST'])
     def save_inputs():
-        """Save user inputs (dummy endpoint for now)"""
-        return jsonify({'success': True, 'message': 'Inputs saved'})
+        """Save user inputs to a JSON file on the server."""
+        try:
+            data = request.json
+            with open(DATA_FILE, 'w') as f:
+                json.dump(data, f, indent=4)
+            return jsonify({'success': True, 'message': 'Inputs saved to server'})
+        except Exception as e:
+            print(f"Error saving inputs: {e}")
+            return jsonify({'success': False, 'message': str(e)}), 500
 
+            
     @app.route('/api/load_inputs', methods=['GET'])
     def load_inputs():
-        """Load user inputs (dummy endpoint for now)"""
-        return jsonify({})
+        """Load user inputs from the JSON file on the server."""
+        try:
+            if os.path.exists(DATA_FILE):
+                with open(DATA_FILE, 'r') as f:
+                    data = json.load(f)
+                return jsonify(data)
+            else:
+                return jsonify({})  # Return empty if no file exists
+        except Exception as e:
+            print(f"Error loading inputs: {e}")
+            return jsonify({}), 500
+
+    @app.route('/api/get_crude_mix', methods=['GET'])
+    def get_crude_mix():
+        """
+        Endpoint to provide just the crude mix data to Streamlit.
+        """
+        try:
+            data = {}
+            if os.path.exists(DATA_FILE):
+                try:
+                    # Check if file is not empty
+                    if os.path.getsize(DATA_FILE) > 0:
+                        with open(DATA_FILE, 'r') as f:
+                            data = json.load(f)
+                    else:
+                        # File is empty, data remains {}
+                        data = {}
+                except json.JSONDecodeError:
+                    # File is corrupt, treat as empty
+                    print(f"Warning: {DATA_FILE} is corrupt or empty. Resetting.")
+                    data = {}
+            
+            # Check if data is a dictionary (prevents crash on 'null')
+            if not isinstance(data, dict):
+                data = {}
+            
+            # Extract the crudeMixData list, or provide a default if not found
+            crude_mix = data.get('crudeMixData', [
+                {"name": "Bonny Light", "percentage": 50},
+                {"name": "Forcados", "percentage": 25},
+                {"name": "Quaiboe", "percentage": 12.5},
+                {"name": "Erha", "percentage": 12.5},
+            ])
+            
+            # Return it in the format Streamlit now expects
+            return jsonify({"crude_mix_data": crude_mix})
+
+        except Exception as e:
+            print(f"Error in /api/get_crude_mix: {e}")
+            return jsonify({"error": str(e)}), 500
 
     @app.route('/api/optimize_crude_mix', methods=['POST'])
     def optimize_crude_mix():

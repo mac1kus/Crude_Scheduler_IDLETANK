@@ -27,8 +27,8 @@ except ImportError:
     print("WARNING: scheduler_solver.py not found. Solver-based scheduling unavailable.")
 
 # ------------------------- CONSTANTS / STATES -------------------------
-READY, FEEDING, EMPTY, FILLING, FILLED, SETTLING, LAB, SUSPENDED = (
-    "READY", "FEEDING", "EMPTY", "FILLING", "FILLED", "SETTLING", "LAB", "SUSPENDED"
+READY, FEEDING, EMPTY, FILLING, FILLED, SETTLING, LAB, SUSPENDED,IDLE = (
+    "READY", "FEEDING", "EMPTY", "FILLING", "FILLED", "SETTLING", "LAB", "SUSPENDED","IDLE"
 )
 
 # ------------------------- SIMULATOR -------------------------
@@ -36,11 +36,53 @@ class Simulator:
     def __init__(self, cfg):
         # Store original config for solver access
         self.cfg = cfg
+        self.tank_name_map = cfg.get("tank_name_map", {}) 
         
         # Inputs
-        self.rate_day = cfg["processing_rate"]  # FIXED processing rate
-        self.rate_hour = self.rate_day / 24.0  # FIXED hourly rate
-        self.N = cfg["num_tanks"]
+        self.rate_day = cfg["processing_rate"]
+        self.rate_hour = self.rate_day / 24.0
+        
+        # --- FIX: TANK INITIALIZATION LOGIC ---
+        
+        # This N is the *max ID* (e.g., 25), used for report columns
+        self.N = cfg["num_tanks"] 
+        # This is the *real* UI count (e.g., 14)
+        self.N_from_ui = int(cfg.get("num_tanks_ui", self.N)) 
+
+        initial_levels = cfg.get("initial_tank_levels", {})
+        
+        # Get all specific IDLE tank IDs (e.g., {25})
+        idle_tank_data_list = self.cfg.get('idle_tank_data', [])
+        idle_tank_ids = set()
+        idle_tank_map = {} # This will hold {25: [{'name': 'Crude B', 'volume': 100000}]}
+        for item in idle_tank_data_list:
+            try:
+                tank_id = int(item.get('sequentialId'))
+                idle_tank_ids.add(tank_id)
+                idle_tank_map[tank_id] = item.get('initialCrudes', [])
+            except (ValueError, TypeError):
+                continue
+
+        # ========== CRITICAL FIX STARTS HERE ==========
+        # Determine the *actual* set of tanks to simulate
+        self.all_tank_ids = set()
+        
+        # Calculate how many "normal" tanks we should have
+        # If we have 14 tanks total and 1 is IDLE (Tank 25), then we have 13 normal tanks (1-13)
+        num_normal_tanks = self.N_from_ui - len(idle_tank_ids)
+        
+        # Add normal tanks (1 to 13 in your case)
+        for i in range(1, num_normal_tanks + 1):
+            self.all_tank_ids.add(i)
+        
+        # Add IDLE tanks (Tank 25 in your case)
+        for idle_id in idle_tank_ids:
+            self.all_tank_ids.add(idle_id)
+        
+        # self.all_tank_ids is now {1, 2, 3, ..., 13, 25}
+        # Tank 14 is successfully excluded!
+        # ========== CRITICAL FIX ENDS HERE ==========
+        
         self.start = cfg["start_dt"]
         self.usable = cfg["usable_per_tank"]
         self.dead_bottom = cfg["dead_bottom"]
@@ -51,6 +93,27 @@ class Simulator:
         self.daily_discharge_log = []
         self.snapshot_log = []
 
+        # Outputs
+        self.daily_log_rows: List[Dict] = []
+        self.daily_summary_rows: List[Dict] = []
+        self.cargo_report_rows: List[Dict] = []
+        self.inventory_data: List[Tuple[datetime, float]] = []
+
+        # --- Initialize all dicts using all_tank_ids ---
+        self.state: Dict[int, str] = {i: READY for i in self.all_tank_ids}
+        self.bbl: Dict[int, float] = {i: initial_levels.get(i, self.usable) for i in self.all_tank_ids}
+        self.daily_consumption: Dict[int, float] = {i: 0.0 for i in self.all_tank_ids}
+        self.ready_for_fill_at: Dict[int, Optional[datetime]] = {i: datetime.min for i in self.all_tank_ids}
+        self.ready_at: Dict[int, Optional[datetime]] = {i: None for i in self.all_tank_ids}
+        self.settle_end_at: Dict[int, Optional[datetime]] = {i: None for i in self.all_tank_ids}
+        self.lab_start_at: Dict[int, Optional[datetime]] = {i: None for i in self.all_tank_ids}
+        self.feed_start_volume: Dict[int, float] = {i: 0.0 for i in self.all_tank_ids}
+        self.tank_feed_start_time: Dict[int, Optional[datetime]] = {i: None for i in self.all_tank_ids}
+        self.tank_cycle_counter: Dict[int, int] = {i: 1 for i in self.all_tank_ids}
+        self.tank_mix = {i: {} for i in self.all_tank_ids}
+        self.tank_mix_pct = {i: {} for i in self.all_tank_ids}
+        # --- End dict initialization ---
+        
         self.settle_hours = cfg["settling_days"] * 24.0
         self.lab_hours = cfg["lab_hours"]
         self.discharge_rate = cfg["discharge_rate"]
@@ -61,96 +124,111 @@ class Simulator:
         self.first_cargo_min_ready = cfg.get("first_cargo_min_ready", 8)
         self.first_cargo_max_ready = cfg.get("first_cargo_max_ready", 9)
         
-        # Snapshot interval in minutes (from config or default to 30)
         self.snapshot_interval_minutes = cfg.get("snapshot_interval_minutes", 30)
         
         self.berth_gap_hours_min = float(cfg.get("berth_gap_hours_min", 0.0))
         self.berth_gap_hours_max = float(cfg.get("berth_gap_hours_max", 0.0))
         self.fill_delay_hours = float(cfg.get("preDischargeDays", 0)) * 24.0
         self.tank_gap_hours = float(cfg.get("tank_gap_hours", 0.0))
-        self.ready_for_fill_at: Dict[int, Optional[datetime]] = {i: datetime.min for i in range(1, self.N + 1)}
         self.tank_fill_gap_hours = float(cfg.get("tankFillGapHours", 0.0))
-
-        # Tank state - all tanks start with exactly usable volume
-        self.state: Dict[int, str] = {i: READY for i in range(1, self.N + 1)}
+        self.scheduling_mode = cfg.get("scheduling_mode", "solver")
         
+        # Parse manual arrival times for First Cargo on Berth 1 and Berth 2
+        try:
+            self.manual_arrival_b1 = datetime.strptime(cfg.get("manual_arrival_b1"), "%Y-%m-%dT%H:%M")
+        except (TypeError, ValueError):
+            self.manual_arrival_b1 = self.start  # Default to Sim Start if invalid
+
+        try:
+            self.manual_arrival_b2 = datetime.strptime(cfg.get("manual_arrival_b2"), "%Y-%m-%dT%H:%M")
+        except (TypeError, ValueError):
+            self.manual_arrival_b2 = self.start  # Default to Sim Start if invalid
+
+        # Flags to track if the first cargo has been scheduled for each berth
+        self.berth_first_cargo_scheduled = {1: False, 2: False}
+    
         # Track state changes with timestamps for accurate logging
-        self.state_history: List[Tuple[datetime, int, str]] = []  # [(timestamp, tank_id, state)]
+        self.state_history: List[Tuple[datetime, int, str]] = []
 
-        initial_levels = cfg.get("initial_tank_levels", {})
-        self.bbl: Dict[int, float] = {i: initial_levels.get(i, self.usable) for i in range(1, self.N + 1)}
-        # Track daily consumption per tank
-        self.daily_consumption: Dict[int, float] = {i: 0.0 for i in range(1, self.N + 1)}
-
-        # FIX: Normalize initial levels to USABLE-ONLY and mark EMPTY accordingly
-        for i in range(1, self.N + 1):
-            gross = float(self.bbl[i] or 0.0)                   # some inputs include heel
-            usable = max(0.0, gross - self.unusable_per_tank)   # store usable only
-            self.bbl[i] = usable
+        # --- FIX: Normalize initial levels AND set correct initial state ---
+        # We loop over all_tank_ids now
+        for i in self.all_tank_ids:
+            gross = float(self.bbl[i] or 0.0)
+            usable = max(0.0, gross - self.unusable_per_tank)
+            self.bbl[i] = usable # Store usable-only volume
+            
+            # Check for all three initial states
             if usable <= 0.0:
-                self.state[i] = EMPTY
-
-        # FIX 2: Track tanks that started empty (should be filled first)
-        self.initially_empty_tanks = [i for i in range(1, self.N + 1) if self.state[i] == EMPTY]
-        # --- CORRECT INITIALIZATION FOR CYCLE COUNTER ---
-        # Initialize cycle counter based on initial state
-        self.tank_cycle_counter: Dict[int, int] = {i: 1 for i in range(1, self.N + 1)}
-        # --- END FINAL CORRECT INITIALIZATION ---
-
-        self.ready_at: Dict[int, Optional[datetime]] = {i: None for i in range(1, self.N + 1)}
-                
-        self.settle_end_at: Dict[int, Optional[datetime]] = {i: None for i in range(1, self.N + 1)}
-        self.lab_start_at: Dict[int, Optional[datetime]] = {i: None for i in range(1, self.N + 1)}
+                # This check handles both regular EMPTY and IDLE tanks with 0 volume
+                if i in idle_tank_ids:
+                    self.state[i] = IDLE
+                else:
+                    self.state[i] = EMPTY
+            elif usable < (self.usable - 100): # Check if partially full (IDLE)
+                self.state[i] = IDLE
+            else:
+                self.state[i] = READY # Tank is full
         
-        # Track initial volume when tank starts feeding (for accurate total draw calculation)
-        self.feed_start_volume: Dict[int, float] = {i: 0.0 for i in range(1, self.N + 1)}
-        self.tank_feed_start_time: Dict[int, Optional[datetime]] = {i: None for i in range(1, self.N + 1)}
-
-        # --- crude mix tracking (used by scheduler_solver) ---
-        self.tank_mix = {i: {} for i in range(1, self.N + 1)}       # crude bbl per tank
-        self.tank_mix_pct = {i: {} for i in range(1, self.N + 1)}   # crude % per tank
-        # --- end crude mix tracking ---
+        # FIX 2: Track tanks that started empty
+        self.initial_state = self.state.copy()
+        self.initially_empty_tanks = [i for i in self.all_tank_ids if self.state[i] == EMPTY]
+        
+        # --- FIX: Log IDLE/EMPTY tanks, make them ready, and load initial crude mix ---
+        for i in self.all_tank_ids:
+            if self.state[i] == IDLE:
+                # Build crude mix string for log message
+                initial_crudes = idle_tank_map.get(i, [])
+                crude_names_str = "Unknown"
+                if initial_crudes:
+                    crude_list = []
+                    for crude_item in initial_crudes:
+                        crude_name = crude_item.get('name')
+                        crude_vol = float(crude_item.get('volume', 0))
+                        if crude_name and crude_vol > 0:
+                            crude_list.append(f"{crude_name}: {crude_vol:,.0f} bbl")
+                            # Populate the tank mix
+                            self.tank_mix[i][crude_name] = crude_vol
+                    if crude_list:
+                        crude_names_str = ", ".join(crude_list)
+                
+                self._log_event(self.start, "Info", "IDLE_FILL", i, None,
+                                f"{self._get_display_name(i)} starts as IDLE with {self.bbl[i]:,.0f} bbl usable crude ({crude_names_str}).")
+                self.ready_for_fill_at[i] = self.start
 
         # Track alert flags
         self.no_feed_alert_logged = False
-        self.first_cargo_scheduled = False  # Track if first cargo has been scheduled
+        self.first_cargo_scheduled = False
         self.tank_filled_first = set() 
-        self.cargo_has_started_filling = set() # <-- ADD THIS NEW LINE
+        self.cargo_has_started_filling = set()
 
         # Start with Tank 1 feeding
         self.active = 1
-        self._change_state(self.active, FEEDING, self.start)
-        self.bbl[self.active] = min(self.bbl[self.active], self.usable)
-        self.feed_start_volume[self.active] = self.bbl[self.active]  # Track starting volume
-        
-        
-        # Berth management: {berth_id: {"free_at": datetime, "current_cargo": dict or None}}
+        # Handle edge case where Tank 1 is IDLE/EMPTY
+        if self.state.get(1) == READY:
+            self._change_state(self.active, FEEDING, self.start)
+            self.bbl[self.active] = min(self.bbl[self.active], self.usable)
+            self.feed_start_volume[self.active] = self.bbl[self.active]
+            self.tank_feed_start_time[self.active] = self.start
+            feed_log_msg = f"Initial feeding starts from Tank {self._get_display_name(self.active)}"
+        else:
+            self.active = 0 # No tank is feeding
+            feed_log_msg = "No initial feeding tank (Tank 1 is not READY)"
+
+        # Berth management
         self.berths = {
             1: {"free_at": self.start, "current_cargo": None},
             2: {"free_at": self.start, "current_cargo": None}
         }
+        self.active_fills: Dict[str, Tuple[int, datetime, datetime, float]] = {}
 
-        # Filling control: only one tank can be filled at a time per cargo
-        # {cargo_vessel_name: (tank_id, end_time, volume_to_fill)}
-        self.active_fills: Dict[str, Tuple[int, datetime, float]] = {}
-
-        # Cargo tracking with unique vessel names
+        # Cargo tracking
         self.cargo_counter = {"VLCC": 0, "SUEZ": 0, "AFRA": 0, "PANA": 0, "HANDY": 0}
-        self.cargos: List[Dict] = []  # Each cargo has unique vessel name
-
-        # Track remaining volume per cargo
+        self.cargos: List[Dict] = []
         self.cargo_remaining_volume: Dict[str, float] = {}
-
-        # Outputs
-        self.daily_log_rows: List[Dict] = []
-        self.daily_summary_rows: List[Dict] = []
-        self.cargo_report_rows: List[Dict] = []
-        self.inventory_data: List[Tuple[datetime, float]] = []  # for chart
         
         self.infeasible = False
         self.infeasible_reason = ""
         
-        # Tanks needed per cargo type
         self.tanks_needed_by_type: Dict[str, int] = {
             name: math.ceil(vol / self.usable) for name, vol in self.enabled_cargos.items()
         }
@@ -158,24 +236,19 @@ class Simulator:
         # Initial log
         self._log_event(self.start, "Info", "SIM_START", None, None,
                         f"Simulation started with processing rate: {int(self.rate_day):,} bbl/day")
-        self._log_event(self.start, "Info", "FEED_START", self.active, None,
-                        f"Initial feeding starts from Tank {self.active}")
-        self.tank_feed_start_time[self.active] = self.start
-       
+        if self.active != 0:
+            self._log_event(self.start, "Info", "FEED_START", self.active, None, feed_log_msg)
+        
         self._log_event(self.start, "Info", "CONFIG", None, None,
                 f"CONFIG: usable_per_tank={self.usable}, dead_bottom={self.dead_bottom}, buffer_volume={self.buffer_volume}, unusable={self.unusable_per_tank}")
 
         # ==================== SOLVER INITIALIZATION ====================
-        # Initialize solver plan manager if available
         self.use_solver_plan = cfg.get('use_optimized_schedule', False)
         self.solver_plan_manager = None
         self.solver_results = cfg.get('solver_results', None)
 
         if self.use_solver_plan and SOLVER_AVAILABLE:
-            
             self.solver_plan_manager = SolverPlanManager(self)
-            
-            # Pass the full config with solver results
             solver_init_params = cfg.copy()
             solver_initialized = self.solver_plan_manager.initialize_solver_plan(solver_init_params)
             
@@ -188,15 +261,12 @@ class Simulator:
                                "Failed to load solver plan - using standard scheduling")
         else:
             if self.use_solver_plan and not SOLVER_AVAILABLE:
-                self._log_event(self.start, "Warning", "SOLVER_UNAVAILABLE", None, None,
-                               "Solver requested but module not found - using standard scheduling")
                 self.use_solver_plan = False
         
-        # Load solver cargos if solver is being used
         if self.use_solver_plan:
+           
             self._load_solver_cargos()
-        # ==================== END SOLVER INITIALIZATION ====================
-    # scheduler.py (Fixed _load_solver_cargos method)
+        
 
     def _load_solver_cargos(self):
         """Pre-load all cargos from solver plan during initialization"""
@@ -263,18 +333,19 @@ class Simulator:
     
     def _get_state_at_time(self, ts: datetime) -> Dict[int, str]:
         """Get tank states as they were at a specific timestamp"""
-        # Start with initial states (all READY except EMPTY ones)
-        states = {}
-        for i in range(1, self.N + 1):
-            if i in self.initially_empty_tanks:
-                states[i] = EMPTY
-            else:
-                states[i] = READY
+        # --- START FIX: Use the true initial state ---
+        # Load the state as it was at the simulation start
+        # This state is {1:READY, ... 13:EMPTY, 25:IDLE, ...}
+        # It has NO ghost tanks.
+        states = self.initial_state.copy()
+        # --- END FIX ---
         
         # Apply state changes in chronological order up to this timestamp
         for change_time, tank_id, new_state in self.state_history:
             if change_time <= ts:
-                states[tank_id] = new_state
+                # This line is fine, as it only updates real tanks
+                if tank_id in states:
+                    states[tank_id] = new_state
             else:
                 break  # History is chronological, so we can stop
         
@@ -285,37 +356,40 @@ class Simulator:
                    state_override: Optional[Dict[int, str]] = None):
         """Logs an event, appending cycle number to relevant event names."""
 
-        event_name_to_log = event # Default to original event name
+        event_name_to_log = event 
 
-        # --- CORRECT LOGIC TO APPEND CYCLE NUMBER ---
-        # List of events that track filling/processing cycles
         cycle_events = {"FILL_START_FIRST", "FILL_FINAL_END", "SETTLING_START", "SETTLING_END", "READY"}
 
         if event in cycle_events and tank_id is not None:
-            # Get the current cycle number for this tank
-            # Use default 1 if somehow missing, though it shouldn't be with correct init
             cycle_num = self.tank_cycle_counter.get(tank_id, 1)
-            # Append the cycle number
             event_name_to_log = f"{event}_{cycle_num}"
-        # --- END CORRECT LOGIC ---
-
-        # Build tank status snapshot - use override if provided, else get state at this timestamp
-        if state_override is not None:
-            tank_status = {f"Tank{i}": state_override.get(i, self.state[i]) for i in range(1, self.N + 1)}
-        else:
-            states_at_ts = self._get_state_at_time(ts)
-            tank_status = {f"Tank{i}": states_at_ts[i] for i in range(1, self.N + 1)}
+        
+        # Build tank status snapshot
+        states_at_ts = self._get_state_at_time(ts) if state_override is None else state_override
+        
+        # --- START FIX: Only create columns for *active* tanks ---
+        tank_status = {}
+        for i in sorted(list(self.all_tank_ids)):
+            tank_status[f"Tank{i}"] = states_at_ts.get(i, self.state.get(i, "ERR"))
+        # --- END FIX ---
 
         row = {
             "Timestamp": ts.strftime("%d/%m/%Y %H:%M"),
             "Level": level,
-            "Event": event_name_to_log, # <<< Use the potentially modified event name
-            "Tank": f"Tank {tank_id}" if tank_id else "",
+            "Event": event_name_to_log,
+            "Tank": self._get_display_name(tank_id) if tank_id else "",
             "Cargo": cargo or "",
             "Message": message
         }
         row.update(tank_status)
         self.daily_log_rows.append(row)
+
+    def _get_display_name(self, tank_id: int) -> str:
+        """Helper to get the custom tank name from the map."""
+        if not tank_id:
+            return ""
+        # self.tank_name_map uses INT keys (e.g., 14)
+        return self.tank_name_map.get(tank_id, f"Tank {tank_id}")
 
     # ------------------------- UTILITIES -------------------------
     def _count_state(self, target: str) -> int:
@@ -355,55 +429,102 @@ class Simulator:
             return self._schedule_cargos_standard(now)
 
     def _schedule_cargos_with_solver(self, now: datetime):
-        """Schedule cargos following solver's predetermined plan - cargo arrives AFTER berth is free"""
+        """
+        Schedule cargos following solver's plan.
+        Logic:
+        - First Cargo: Checks 'scheduling_mode'.
+            - Manual: Use User Date.
+            - Solver: Use RANDOM Gap from Start Time (Min/Max).
+        - Subsequent Cargos: Proactive Gap Logic (Rush if low stock).
+        """
         
+        berths_checked = set()
+
         for cargo in self.cargos:
-            if cargo.get('dispatched', False) == False:
-                berth = self.berths[cargo['berth']]
+            # Skip if already dispatched
+            if cargo.get('dispatched', False):
+                continue
+
+            berth_id = cargo['berth']
+            
+            # Avoid processing the same berth twice in one tick
+            if berth_id in berths_checked:
+                continue
+            
+            berth = self.berths[berth_id]
+            berths_checked.add(berth_id)
+            
+            # ---------------------------------------------------------
+            # LOGIC: Determine Arrival Time
+            # ---------------------------------------------------------
+            
+            # === CASE 1: FIRST CARGO FOR THIS BERTH ===
+            if not self.berth_first_cargo_scheduled[berth_id]:
                 
-               
-                # 1. Calculate a random gap for this specific cargo
-                random_gap_hours = random.uniform(self.berth_gap_hours_min, self.berth_gap_hours_max)
+                # OPTION A: MANUAL MODE (User decides exact date)
+                if self.scheduling_mode == 'manual':
+                    if berth_id == 1:
+                        calculated_arrival = self.manual_arrival_b1
+                    else:
+                        calculated_arrival = self.manual_arrival_b2
+                
+                # OPTION B: SOLVER MODE (System calculates RANDOM Start Gap)
+                else:
+                    # CHANGED: Use random.uniform instead of just berth_gap_hours_min
+                    first_gap = random.uniform(self.berth_gap_hours_min, self.berth_gap_hours_max)
+                    calculated_arrival = self.start + timedelta(hours=first_gap)
 
-                # 2. Calculate when this cargo *can* arrive.
-                #    It's the time the berth was last free + the required gap.
-                earliest_arrival_time = berth["free_at"] + timedelta(hours=random_gap_hours)
-                # --- END MODIFICATION ---
+            # === CASE 2: SUBSEQUENT CARGOS ===
+            else:
+                # Check Inventory Health (Proactive Logic)
+                ready_count = self._count_state(READY)
+                feeding_count = self._count_state(FEEDING)
+                total_active = ready_count + feeding_count
+                
+                # If tanks are low, rush the vessel (Min Gap)
+                if total_active <= self.min_ready_tanks:
+                    used_gap = self.berth_gap_hours_min
+                    urgency_msg = " [PROACTIVE: RUSHING]"
+                # If tanks are healthy, use Random Gap
+                else:
+                    used_gap = random.uniform(self.berth_gap_hours_min, self.berth_gap_hours_max)
+                    urgency_msg = ""
 
-                # 3. Check if the berth is free AND we are at (or past) the calculated arrival time
-                if berth["current_cargo"] is None and now >= earliest_arrival_time:
+                # Calculate arrival relative to when the berth became free
+                calculated_arrival = berth["free_at"] + timedelta(hours=used_gap)
+            
+            if now >= calculated_arrival:
+                # Double check berth is free
+                if berth["current_cargo"] is None:
                     
                     cargo['dispatched'] = True
                     berth["current_cargo"] = cargo
+                    self.berth_first_cargo_scheduled[berth_id] = True
                     
-                    # 3. Update the cargo's times to the *actual* calculated times
-                    actual_arrival = earliest_arrival_time
-                    cargo['arrival'] = actual_arrival
-                    cargo['fill_start'] = actual_arrival + timedelta(hours=self.fill_delay_hours)
+                    cargo['arrival'] = calculated_arrival
+                    cargo['fill_start'] = calculated_arrival + timedelta(hours=self.fill_delay_hours)
                     
-                    # 4. Do NOT update berth["free_at"] here. This is only done
-                    #    when this cargo *finishes* (in _maybe_finish_fill).
-
-                    # --- END FIX ---
-
-                    # Log arrival event ONLY ONCE
+                    # Log the event
                     if not cargo.get('arrival_logged', False):
+                        is_first = "First" if now == calculated_arrival else "Subsequent" 
+                        if 'urgency_msg' not in locals(): urgency_msg = ""
+                        
                         self._log_event(
-                            actual_arrival,
+                            calculated_arrival, 
                             "Success",
                             "ARRIVAL",
                             None,
                             cargo["vessel_name"],
-                            f"BERTH {cargo['berth']} CARGO ARRIVED. Fill starts at {cargo['fill_start'].strftime('%d/%m %H:%M')}"
+                            f"BERTH {cargo['berth']} Cargo Arrived ({self.scheduling_mode.upper()} logic){urgency_msg}. Fill starts {cargo['fill_start'].strftime('%d/%m %H:%M')}"
                         )
                         cargo["arrival_logged"] = True
-                    break  # Only dispatch one cargo per check
-
+                    
+                    continue
 
     def _schedule_cargos_standard(self, now: datetime):
         """Original cargo scheduling logic (random selection)"""
         ready_count = self._count_state(READY)
-        print(f"\n[SCHEDULE CHECK] Day {(now - self.start).days + 1}: {ready_count} READY tanks, First cargo scheduled: {self.first_cargo_scheduled}")
+        #print(f"\n[SCHEDULE CHECK] Day {(now - self.start).days + 1}: {ready_count} READY tanks, First cargo scheduled: {self.first_cargo_scheduled}")
 
         for berth_id, berth in self.berths.items():
             if berth["current_cargo"] is None and berth["free_at"] <= now:
@@ -439,7 +560,7 @@ class Simulator:
                     continue
                 
                 # PURE RANDOM CHOICE - NO CONSTRAINTS
-                import random
+              
                 cargo_type = random.choice(available_types)
                 
                 # Schedule the selected cargo type
@@ -478,7 +599,7 @@ class Simulator:
         """Complete fills that have reached end time"""
         finished_cargos = []
         
-        for vessel_name, (tid, end_time, volume_to_fill) in list(self.active_fills.items()):
+        for vessel_name, (tid, start_time, end_time, volume_to_fill) in list(self.active_fills.items()):
             if now >= end_time:
                 # CRITICAL FIX: ADD to existing volume, don't replace it
                 current_volume = self.bbl.get(tid, 0.0)
@@ -506,7 +627,7 @@ class Simulator:
                 remaining_after_fill = max(0.0, current_cargo_remaining - volume_to_fill)
                 
                 self._log_event(end_time, "Info", event_name, tid, vessel_name,
-                                f"Tank {tid} fill completed: added {volume_to_fill:,.0f} bbl (now {display_now_total:,.0f} bbl). "
+                                f"{self._get_display_name(tid)} fill completed: added {volume_to_fill:,.0f} bbl (now {display_now_total:,.0f} bbl). "
                                 f"Cargo remaining: {remaining_after_fill:,.0f} bbl")
                 # --- END FIX ---
                 
@@ -571,7 +692,7 @@ class Simulator:
                     
                     # Log settling start
                     self._log_event(end_time, "Info", "SETTLING_START", tid, vessel_name,
-                                    f"Tank {tid} FILLED FULL ({self.bbl[tid]:,.0f} bbl) - Mix: [{crude_mix_str}] - "
+                                    f" {self._get_display_name(tid)} FILLED FULL({self.bbl[tid]:,.0f} bbl) - Mix: [{crude_mix_str}] - "
                                     f"Settling for {self.settle_hours:.0f} hours")
                     # --- END CHANGE 2 (Continued) ---
 
@@ -613,7 +734,7 @@ class Simulator:
                     # Log this new gap if it's greater than 0
                     if self.tank_fill_gap_hours > 0:
                         self._log_event(end_time, "Info", "TANK_GAP_START", tid, vessel_name,
-                                        f"Tank {tid} complete. {vessel_name} waiting for {self.tank_fill_gap_hours}h gap. Next fill available at {next_available.strftime('%d/%m %H:%M')}")
+                                        f" {self._get_display_name(tid)} complete. {vessel_name} waiting for {self.tank_fill_gap_hours}h gap. Next fill available at {next_available.strftime('%d/%m %H:%M')}")
                     
                     self._maybe_start_fill(end_time)
 
@@ -640,11 +761,9 @@ class Simulator:
                 self.cargo_remaining_volume.get(cargo["vessel_name"], 0) > 1.0
                 and cargo["vessel_name"] not in self.active_fills
             )
-            
             if not base_condition:
                 continue
-            
-            
+                        
             # Only check fill_start time if cargo hasn't started discharging yet
             if cargo["discharge_start"] is None:
                 if self.use_solver_plan:
@@ -665,6 +784,25 @@ class Simulator:
                 assigns = self.cargo_to_tank_assignments.get(cargo_key, [])
 
                 if assigns:
+                    # --- START FIX: Sort assignments based on the master sequence ---
+                    if hasattr(self, 'solver_tank_sequence') and self.solver_tank_sequence:
+                        master_sequence = self.solver_tank_sequence
+                        
+                        # Create a lookup map for the sequence order
+                        sequence_order = {str(tank_id).split('(')[0].replace('TK', ''): index 
+                                          for index, tank_id in enumerate(master_sequence)}
+                        
+                        def get_sort_key(assignment):
+                            # Get the base tank ID (e.g., '41')
+                            tank_id = assignment.get("tank_id")
+                            base_tank_id_str = str(tank_id).split('(')[0].replace('TK', '')
+                            # Find its position in the master sequence
+                            return sequence_order.get(base_tank_id_str, 9999) # Put unknown tanks at the end
+
+                        assigns.sort(key=get_sort_key)
+                    else:
+                        pass
+                    # --- END FIX ---
                     target = None
                     for a in assigns:
                         planned_tid = a.get("tank_id")
@@ -686,7 +824,7 @@ class Simulator:
                         # --- FIX 3A: Enforce tankGapHours for solver logic ---
                         rest_time_over = now >= self.ready_for_fill_at.get(planned_tid, datetime.min)
 
-                        if assign_remaining > 1.0 and self.state.get(planned_tid) in (EMPTY, SUSPENDED) and rest_time_over:
+                        if assign_remaining > 1.0 and self.state.get(planned_tid) in (EMPTY, SUSPENDED,IDLE) and rest_time_over:
                         # --- END FIX 3A ---
                             current_volume = self.bbl.get(planned_tid, 0.0)
                             if current_volume < self.usable - 100:
@@ -714,7 +852,7 @@ class Simulator:
 
                             actual_fill_hours = volume_to_fill / max(self.discharge_rate, 1e-6)
                             end_time = now + timedelta(hours=actual_fill_hours)
-                            self.active_fills[cargo["vessel_name"]] = (tid, end_time, volume_to_fill)
+                            self.active_fills[cargo["vessel_name"]] = (tid, now, end_time, volume_to_fill) # Add 'now' as start_time
 
                             a["filled"] = filled_so_far + volume_to_fill
 
@@ -729,14 +867,14 @@ class Simulator:
                             vessel_name = cargo["vessel_name"]
                             if vessel_name not in self.cargo_has_started_filling:
                                 message = (
-                                    f"BERTH {cargo['berth']}: First fill from {vessel_name} filling Tank {tid} "
+                                    f"BERTH {cargo['berth']}: First fill from {vessel_name} filling {self._get_display_name(tid)} "
                                     f"with {volume_to_fill:,.0f} bbl {crude_type} "
                                     f"(current: {display_current:,.0f}, target: {display_target:,.0f})"
                                 )
                                 self.cargo_has_started_filling.add(vessel_name)
                             else:
                                 message = (
-                                    f"BERTH {cargo['berth']}: Start (solver) filling Tank {tid} with {volume_to_fill:,.0f} bbl {crude_type} "
+                                    f"BERTH {cargo['berth']}: Start (solver) filling{self._get_display_name(tid)} with {volume_to_fill:,.0f} bbl {crude_type} "
                                     f"(current: {display_current:,.0f}, target: {display_target:,.0f})"
                                 )
                             
@@ -762,7 +900,7 @@ class Simulator:
             if self.initially_empty_tanks:
                 # --- FIX 3B: Enforce tankGapHours for initially empty tanks ---
                 tid = next((i for i in self.initially_empty_tanks 
-                            if self.state[i] in (EMPTY, SUSPENDED)
+                            if self.state[i] in (EMPTY, SUSPENDED,IDLE)
                             and now >= self.ready_for_fill_at.get(i, datetime.min)), None)
                 # --- END FIX 3B ---
                 
@@ -773,7 +911,7 @@ class Simulator:
                 # --- FIX 3C: Enforce tankGapHours for regular empty/suspended tanks ---
                 # Look for EMPTY or SUSPENDED tanks that are ready for filling
                 tid = next((i for i in range(1, self.N + 1)
-                            if self.state[i] in (EMPTY, SUSPENDED) 
+                            if self.state[i] in (EMPTY, SUSPENDED,IDLE) 
                             # NEW CHECK: Must be past the preparation time
                             and now >= self.ready_for_fill_at.get(i, datetime.min)
                             and i not in self.initially_empty_tanks), None)
@@ -789,7 +927,7 @@ class Simulator:
 
                 actual_fill_hours = volume_to_fill / max(self.discharge_rate, 1e-6)
                 end_time = now + timedelta(hours=actual_fill_hours)
-                self.active_fills[cargo["vessel_name"]] = (tid, end_time, volume_to_fill)
+                self.active_fills[cargo["vessel_name"]] = (tid, now, end_time, volume_to_fill) # Add 'now' as start_time
 
                 event_name = "FILL_START"
                 if tid not in self.tank_filled_first:
@@ -801,7 +939,7 @@ class Simulator:
                 self._log_event(
                     now,
                     "Info", event_name, tid, cargo["vessel_name"],
-                    f"BERTH {cargo['berth']}: Start filling Tank {tid} with {volume_to_fill:,.0f} bbl "
+                    f"BERTH {cargo['berth']}: Start filling{self._get_display_name(tid)} with {volume_to_fill:,.0f} bbl "
                     f"(rate {self.discharge_rate:,.0f} bbl/hr, duration {actual_fill_hours:.2f} h)"
                 )
                 
@@ -817,14 +955,30 @@ class Simulator:
     
     def _find_next_ready_sequential(self, start_from: int) -> Optional[int]:
         """Find next READY tank in sequential order (1→2→3→...→N→1)"""
-        # Start from next tank after current active
-        for offset in range(1, self.N + 1):
-            tank_id = ((start_from - 1 + offset) % self.N) + 1
+        
+        # --- FIX: Create a chronological list of real tanks to iterate over ---
+        # 1. Get the sorted list of all existing tank IDs
+        all_real_tanks = sorted(list(self.all_tank_ids))
+        
+        # 2. Find the starting index for the sequential search
+        try:
+            start_index = all_real_tanks.index(start_from)
+        except ValueError:
+            # If start_from is 0 or not found, start from the beginning
+            start_index = -1 
+            
+        # 3. Iterate sequentially, starting after 'start_from' and wrapping around
+        num_tanks_real = len(all_real_tanks)
+        for offset in range(1, num_tanks_real + 1):
+            tank_index = (start_index + offset) % num_tanks_real
+            tank_id = all_real_tanks[tank_index]
+            
+            # Check the state of the existing tank
             if self.state[tank_id] == READY:
                 return tank_id
-        return None 
-    
-    
+        
+        return None
+        
     # ------------------------- FEEDING -------------------------
     def _ensure_feeding(self, now: datetime):
         """Ensure a READY tank is feeding in SEQUENTIAL ORDER"""
@@ -852,7 +1006,7 @@ class Simulator:
                 self.no_feed_alert_logged = False
             
             self._log_event(now, "Success", "FEED_START", self.active, None,
-                          f"Tank {self.active} now starts feeding with {self.bbl[self.active]:,.0f} bbl available")
+                          f"{self._get_display_name(self.active)} now starts feeding with {self.bbl[self.active]:,.0f} bbl available")
         else:
             # No READY tanks available - log only once
             if not self.no_feed_alert_logged:
@@ -861,8 +1015,6 @@ class Simulator:
                 self._log_event(now, "Danger", "NO_FEED_AVAILABLE", None, None,
                               f"No tanks available for feeding. READY: {ready_count}, FEEDING: {feeding_count}")
                 self.no_feed_alert_logged = True
-
-    # scheduler.py (inside class Simulator)
 
     def _consume_hour(self, now: datetime, hour_end: datetime) -> float:
         """Consume for up to one hour - FIXED RATE PROCESSING"""
@@ -886,7 +1038,7 @@ class Simulator:
             self.ready_for_fill_at[self.active] = now + timedelta(hours=self.tank_gap_hours)
             
             self._log_event(now, "Warning", "FEED_ERROR", self.active, None,
-                          f"Tank {self.active} marked as FEEDING but has no usable volume (current: {available_in_tank:,.0f} bbl, unusable: {self.unusable_per_tank:,.0f} bbl)")
+                          f"{self._get_display_name(self.active)} marked as FEEDING but has no usable volume (current: {available_in_tank:,.0f} bbl, unusable: {self.unusable_per_tank:,.0f} bbl)")
             return processed
         
         time_to_empty_h = available_in_tank / self.rate_hour
@@ -913,6 +1065,13 @@ class Simulator:
             # Reset 'first_fill' flag
             if emptied_tank in self.tank_filled_first:
                 self.tank_filled_first.remove(emptied_tank)
+
+            # --- START FIX: Reset the tank's crude mix, as it is now empty ---
+            if emptied_tank in self.tank_mix:
+                self.tank_mix[emptied_tank] = {}
+            if emptied_tank in self.tank_mix_pct:
+                self.tank_mix_pct[emptied_tank] = {}
+            # --- END FIX ---
             
             # Track feeding event for reports
             if self.tank_feed_start_time.get(emptied_tank):
@@ -932,14 +1091,12 @@ class Simulator:
             
             # 1. Log TANK_EMPTY status/warning
             self._log_event(t_empty, "Warning", "TANK_EMPTY", emptied_tank, None,
-                          f"Tank {emptied_tank} emptied. Total draw {total_draw:,.0f} bbl.")
+                          f"{self._get_display_name(emptied_tank)} emptied. Total draw {total_draw:,.0f} bbl.")
             
             # 2. Log EMPTY_START (preparation time) if there is a configured gap
             if self.tank_gap_hours > 0:
                  self._log_event(t_empty, "Info", "EMPTY_START", emptied_tank, None,
-                                f"Tank {emptied_tank} emptied. Preparation time of {self.tank_gap_hours}h required. Ready for fill at {self.ready_for_fill_at[emptied_tank].strftime('%d/%m %H:%M')}")
-            
-            # --- END FIX ---
+                                f"{self._get_display_name(emptied_tank)} emptied. Preparation time of {self.tank_gap_hours}h required. Ready for fill at {self.ready_for_fill_at[emptied_tank].strftime('%d/%m %H:%M')}")
             
             # Look for next READY tank in SEQUENTIAL ORDER
             nxt = self._find_next_ready_sequential(emptied_tank)
@@ -962,7 +1119,7 @@ class Simulator:
                 # Change state at exact time
                 self._change_state(self.active, FEEDING, t_empty)
                 self._log_event(t_empty, "Success", "FEED_CHANGEOVER", self.active, None,
-                              f"Tank {self.active} starts feeding with {self.bbl[self.active]:,.0f} bbl")
+                              f"{self._get_display_name(self.active)} starts feeding with {self.bbl[self.active]:,.0f} bbl")
                 
                 # Process remainder of hour at FIXED RATE
                 remaining_hour = hour_length_h - time_to_empty_h
@@ -989,8 +1146,10 @@ class Simulator:
         2. Check for LAB tanks that finished testing -> move to READY
         """
         newly_ready_count = 0
-        for i in range(1, self.N + 1):
-            
+        
+        
+        for i in self.all_tank_ids:
+                    
             # --- Step 1: Check for finished SETTLING ---
             if self.state[i] == SETTLING and self.settle_end_at[i] and self.settle_end_at[i] <= now:
                 settle_end_time = self.settle_end_at[i]
@@ -1003,10 +1162,10 @@ class Simulator:
                     lab_end_time = self.ready_at.get(i) 
                     lab_end_str = lab_end_time.strftime('%d/%m %H:%M') if lab_end_time else "Unknown"
                     
-                    # Log first, then change state 1 second later
+                    # Change state FIRST, then log
+                    self._change_state(i, LAB, settle_end_time)
                     self._log_event(settle_end_time, "Info", "SETTLING_END", i, None,
                                     f"Settling ends. Lab testing starts for {self.lab_hours:.0f} hours (ready at {lab_end_str})")
-                    self._change_state(i, LAB, settle_end_time + timedelta(seconds=1))
 
                 # Case B: No lab testing, SETTLING -> READY
                 elif self.lab_hours <= 0:
@@ -1014,11 +1173,9 @@ class Simulator:
                         self.bbl[i] = self.usable
                         ready_time = self.ready_at[i]
                         
-                        # --- START FIX: Clear ALL timers ---
                         self.ready_at[i] = None
                         self.settle_end_at[i] = None
                         self.lab_start_at[i] = None
-                        # --- END FIX ---
                         
                         newly_ready_count += 1
                         
@@ -1031,10 +1188,9 @@ class Simulator:
                                 mix_parts.append(f"{crude}: {pct:.1f}%")
                             crude_mix_str = ", ".join(mix_parts)
                         
-                        # Log first, then change state 1 second later
+                        self._change_state(i, READY, ready_time)
                         self._log_event(ready_time, "Success", "READY", i, None,
-                                    f"Tank {i} now READY - Mix: [{crude_mix_str}]")
-                        self._change_state(i, READY, ready_time + timedelta(seconds=1))
+                                    f"{self._get_display_name(i)} now READY - Mix: [{crude_mix_str}]")
 
                         if i in self.tank_cycle_counter:
                             self.tank_cycle_counter[i] += 1
@@ -1047,11 +1203,9 @@ class Simulator:
                 self.bbl[i] = self.usable
                 ready_time = self.ready_at[i]
                 
-                # --- START FIX: Clear ALL timers ---
                 self.ready_at[i] = None
                 self.lab_start_at[i] = None 
                 self.settle_end_at[i] = None
-                # --- END FIX ---
 
                 newly_ready_count += 1
                 
@@ -1062,10 +1216,9 @@ class Simulator:
                         mix_parts.append(f"{crude}: {pct:.1f}%")
                     crude_mix_str = ", ".join(mix_parts)
                 
-                # Log first, then change state 1 second later
+                self._change_state(i, READY, ready_time)
                 self._log_event(ready_time, "Success", "READY", i, None,
-                            f"Tank {i} now READY - Mix: [{crude_mix_str}]")
-                self._change_state(i, READY, ready_time + timedelta(seconds=1))
+                            f"{self._get_display_name(i)} now READY - Mix: [{crude_mix_str}]")
                 
                 if i in self.tank_cycle_counter:
                     self.tank_cycle_counter[i] += 1
@@ -1079,13 +1232,45 @@ class Simulator:
         if not hasattr(self, 'snapshot_log'):
             self.snapshot_log = []
         
-        snapshot = {
-            'Timestamp': now.strftime("%d/%m/%Y %H:%M"),
+        # --- START FIX: Create lookup for actively filling tanks ---
+        filling_tanks = {
+            t_data[0]: (t_data[1], t_data[2], t_data[3]) 
+            for v_name, t_data in self.active_fills.items()
         }
-        for i in range(1, self.N + 1):
-            snapshot[f'Tank{i}'] = f"{self.bbl[i]:,.0f}"
-            snapshot[f'State{i}'] = self.state[i]
+        # --- END FIX ---
+
+        snapshot = {
+            'Timestamp': now.strftime("%d/%m/%Y %H:%M"), 
+        }
         
+        # --- CRITICAL FIX: Loop over real tanks only (self.all_tank_ids) ---
+        for i in self.all_tank_ids: 
+        # --- END CRITICAL FIX ---
+            
+            # --- START FIX: Interpolate volume for FILLING tanks ---
+            if self.state[i] == FILLING and i in filling_tanks: 
+                start_time, end_time, total_volume_to_add = filling_tanks[i]
+                
+                base_volume = self.bbl[i] 
+                
+                total_duration_sec = (end_time - start_time).total_seconds()
+                elapsed_sec = (now - start_time).total_seconds()
+                
+                volume_added_so_far = 0.0
+                if total_duration_sec > 0 and elapsed_sec > 0:
+                    fill_percent = min(1.0, elapsed_sec / total_duration_sec)
+                    volume_added_so_far = total_volume_to_add * fill_percent
+                    
+                current_interpolated_volume = base_volume + volume_added_so_far
+                snapshot[f'Tank{i}'] = f"{current_interpolated_volume:,.0f}"
+            
+            else:
+                # --- Original logic ---
+                snapshot[f'Tank{i}'] = f"{self.bbl[i]:,.0f}"
+            # --- END FIX ---
+            
+            snapshot[f'State{i}'] = self.state[i]
+                      
         self.snapshot_log.append(snapshot)
     
     def simulate_day(self, day_index: int):
@@ -1098,48 +1283,57 @@ class Simulator:
         # Promote SETTLING/LAB tanks to READY at day start
         newly_ready_count = self._promote_ready_tanks(day_start)
 
-        # Reset daily consumption for all tanks
-        for i in range(1, self.N + 1):
+        # Reset daily consumption for all *real* tanks
+        for i in self.all_tank_ids:
             self.daily_consumption[i] = 0.0
 
         # Count ready tanks at start of day
         ready_start = self._count_state(READY)
         feeding_start = self._count_state(FEEDING)
         
-        # Calculate stock: tank_level - (dead_bottom + buffer_volume/2)
+        # Calculate stock:
         ready_tanks_detail = []
         ready_stock = 0
         empty_tanks_detail = []
-        for i in range(1, self.N + 1):
+        idle_tanks_detail = []
+        idle_stock = 0
+
+        # --- FIX: Loop over real tanks only ---
+        for i in self.all_tank_ids:
             if self.state[i] == READY:
                 tank_usable_stock = self.bbl[i] 
-                #tank_usable_stock = max(0,self.bbl[i] - self.unusable_per_tank)
                 ready_stock += tank_usable_stock
-                # Track tanks with non-standard stock (only for day 1 message)
                 if day_index == 0:
-                    ready_tanks_detail.append(f"Tank{i}: {tank_usable_stock:,.0f}")
+                    ready_tanks_detail.append(f"{self._get_display_name(i)}: {tank_usable_stock:,.0f}")
+            
             elif self.state[i] == EMPTY and day_index == 0:
-                # Show EMPTY tanks with their current stock
                 tank_empty_stock = self.bbl[i]
-                empty_tanks_detail.append(f"Tank{i}: {tank_empty_stock:,.0f}")
+                empty_tanks_detail.append(f"{self._get_display_name(i)}: {tank_empty_stock:,.0f}")
+            
+            elif self.state[i] == IDLE and day_index == 0:
+                tank_idle_stock = self.bbl[i]
+                idle_stock += tank_idle_stock # We track this but don't add to TOTAL
+                idle_tanks_detail.append(f"{self._get_display_name(i)}: {tank_idle_stock:,.0f}")
+        # --- END FIX ---
 
-        # FEEDING tank - only ONE at day start
-        # FEEDING tanks - collect all feeding tanks with their volumes
+        # FEEDING tanks
         feeding_tanks_detail = []
         feeding_stock = 0
-        for i in range(1, self.N + 1):
+        # --- FIX: Loop over real tanks only ---
+        for i in self.all_tank_ids:
             if self.state[i] == FEEDING:
                 tank_feed_stock = self.bbl[i]
                 feeding_stock += tank_feed_stock
-                feeding_tanks_detail.append(f"Tank {i}: {self.bbl[i]:,.0f} bbl")
+                # This is the fix for "Tank Tank 1"
+                feeding_tanks_detail.append(f"{self._get_display_name(i)}: {self.bbl[i]:,.0f} bbl")
 
+        # --- FIX (Corrected): TOTAL is ONLY Ready + Feeding ---
         total_stock = ready_stock + feeding_stock
+        certified_stock = total_stock # Certified stock = Ready + Feeding
         
-        # Calculate certified stock (READY + FEEDING) - this goes in DAILY_STATUS TOTAL
-        certified_stock = total_stock
-        
-        # Calculate TRUE opening stock (ALL tanks including FILLING, SETTLING, LAB, etc.)
-        true_opening_stock = sum(self.bbl[i] for i in range(1, self.N + 1))
+        # TRUE opening stock (ALL tanks including IDLE, FILLING, etc.)
+        true_opening_stock = sum(self.bbl[i] for i in self.all_tank_ids)
+        # --- END FIX ---
 
         # Build feeding detail string
         if feeding_tanks_detail:
@@ -1151,58 +1345,47 @@ class Simulator:
         if day_index == 0:
             ready_detail_str = f" [{', '.join(ready_tanks_detail)}]" if ready_tanks_detail else ""
             empty_detail_str = f", EMPTY: [{', '.join(empty_tanks_detail)}]" if empty_tanks_detail else ""
+            idle_detail_str = f", IDLE: [{', '.join(idle_tanks_detail)}]" if idle_tanks_detail else ""
     
             self._log_event(day_start, "Info", "DAILY_STATUS", None, None,
-                f"Day starts - STOCK: READY TANKS ({ready_start}): {ready_stock:,.0f} bbl{ready_detail_str}{empty_detail_str}, FEEDING TANKS: {feeding_detail_str}, TOTAL: {certified_stock:,.0f} bbl")
+                f"Day starts - STOCK: READY TANKS ({ready_start}): {ready_stock:,.0f} bbl{ready_detail_str}{empty_detail_str}{idle_detail_str}, FEEDING TANKS: {feeding_detail_str}, TOTAL: {certified_stock:,.0f} bbl")
         else:
-            # Day 2+ or no special tanks - simple message
+            # Day 2+
             self._log_event(day_start, "Info", "DAILY_STATUS", None, None,
                         f"Day starts - STOCK: READY TANKS ({ready_start}): {ready_stock:,.0f} bbl, FEEDING TANKS: {feeding_detail_str}, TOTAL: {certified_stock:,.0f} bbl")
 
         # Schedule cargos
         self.schedule_cargos(day_start)
 
-        # Daily snapshot - use calculated stock
         opening_stock = true_opening_stock
-
        
         total_processed_today = 0.0
         
-        # Calculate the precise, absolute end time for the simulation run
         simulation_end_dt = self.start + timedelta(days=self.horizon_days)
         
-        # Minutely loop
         now = day_start
         snapshot_interval = timedelta(minutes=self.snapshot_interval_minutes)
         next_snapshot = day_start
         
         while now < day_end:
-            
-            # CRITICAL BREAK CHECK: If we're already at or past the final time, break the daily loop
             if now >= simulation_end_dt:
                  break
             
-            # Log 30-minute snapshot
             if now >= next_snapshot:
                 self._log_tank_snapshot(now)
                 next_snapshot += snapshot_interval
                  
-            # Promote any tanks that become READY during this hour
             newly_ready = self._promote_ready_tanks(now)
-            
             self._maybe_finish_fill(now)
-            
+          
             self._ensure_feeding(now)
             self._maybe_start_fill(now)
             
-            # Use step_end logic (use snapshot interval for step size)
             step_end = min(day_end, now + timedelta(minutes=self.snapshot_interval_minutes)) 
             
-            # Cap the step_end to the absolute simulation end time
             if step_end > simulation_end_dt:
                 step_end = simulation_end_dt
                 
-            # If the next step takes us beyond the final minute of the simulation, skip consumption.
             if now >= step_end: 
                  break 
             
@@ -1212,64 +1395,48 @@ class Simulator:
             now = step_end
             
             self._maybe_finish_fill(now)
-            
-            # Promote tanks immediately when they become ready
             self._promote_ready_tanks(now)
 
         
-        # --- FINAL REPORT GENERATION FIX ---
-        # total_processed_today is now the correct, accumulated volume for the period run.
         final_processed_for_report = total_processed_today
         
-        # Calculate Closing Stock based on accurate processing amount
-        closing_stock = true_opening_stock - final_processed_for_report
+        # Calculate TRUE closing stock (ALL real tanks)
+        true_closing_stock = sum(self.bbl[i] for i in self.all_tank_ids)
         
-        # Calculate TRUE closing stock (ALL tanks at end of day)
-        true_closing_stock = sum(self.bbl[i] for i in range(1, self.N + 1))
-        
-        # Calculate opening certified stock (READY + FEEDING at day start)
-        # This was already calculated at the beginning of simulate_day as 'certified_stock'
-        opening_cert_stk = certified_stock  # From day start calculation
-        
-        # Calculate uncertified stock (opening stock - certified stock)
+        opening_cert_stk = certified_stock
         opening_uncert_stk = true_opening_stock - opening_cert_stk
         
         ready_end = self._count_state(READY)
         empty_end = self._count_state(EMPTY)
         feeding_end = self._count_state(FEEDING)
-        # --- END FINAL REPORT GENERATION FIX ---
 
         # Build feeding tanks detail - ALL tanks that fed during the day
         feeding_day_detail = []
-        for i in range(1, self.N + 1):
+        # --- FIX: Loop over real tanks only ---
+        for i in self.all_tank_ids:
             if self.daily_consumption[i] > 0:
-                feeding_day_detail.append(f"Tank {i}: {self.daily_consumption[i]:,.0f} bbl")
+                feeding_day_detail.append(f"{self._get_display_name(i)}: {self.daily_consumption[i]:,.0f} bbl")
 
         feeding_day_str = ", ".join(feeding_day_detail) if feeding_day_detail else "None"
         
-        # --- START LOG MESSAGE FIX: Clean message for all days ---
-        
         log_timestamp = min(now, day_end) if now < day_end else day_end - timedelta(minutes=1)
-        
-        # CRITICAL FIX: Force the message suffix to be empty to remove "at HH:MM hrs"
         message_suffix = "" 
 
-        # Log end of day status
         self._log_event(log_timestamp, "Info", "DAILY_END", None, None,
                     f"Day ends{message_suffix} with {ready_end} READY tanks, FEEDING tank(s): {feeding_day_str}, Processed: {final_processed_for_report:,.0f} bbl")
-        # --- END LOG MESSAGE FIX ---
         
         # Calculate certified stock (READY + FEEDING only) for inventory chart
-        certified_closing_stock = sum(self.bbl[i] for i in range(1, self.N + 1) 
+        certified_closing_stock = sum(self.bbl[i] for i in self.all_tank_ids 
                                       if self.state[i] in [READY, FEEDING])
         
-        # Store certified stock data for chart
         self.inventory_data.append((day_start, certified_closing_stock / 1_000_000))
 
-        # Tank status columns
-        tank_status = {f"Tank{i}": self.state[i] for i in range(1, self.N + 1)}
+        # --- START FIX: Only create columns for *active* tanks ---
+        tank_status = {}
+        for i in sorted(list(self.all_tank_ids)):
+            tank_status[f"Tank{i}"] = self.state.get(i, "")
+        # --- END FIX ---
         
-        # Final Row Population (using fixed variables)
         row = {
             "Date": day_start.strftime("%d/%m/%Y %H:%M"),
             "Opening Stock (bbl)": f"{true_opening_stock:,.0f}",
@@ -1282,7 +1449,6 @@ class Simulator:
         }
         row.update(tank_status)
         self.daily_summary_rows.append(row)
-
     # ------------------------- RUN -------------------------
     def run(self):
         if self.infeasible:
@@ -1306,8 +1472,6 @@ class Simulator:
             self.simulate_day(day_index)
             if self.infeasible:
                 break
-        # --- END FIX ---
-            
        
     def generate_cargo_report(self):
         """Generate cargo report with enhanced formatting"""
@@ -1351,7 +1515,6 @@ class Simulator:
             # Update the last discharge time for this berth for the *next* iteration
             if cargo.get("discharge_end"):
                 last_discharge_end_by_berth[berth_id] = cargo["discharge_end"]
-        # --- END NEW BLOCK (1 of 2) ---
 
         # 2. Generate report rows (existing logic)
         for cargo in self.cargos:
@@ -1379,13 +1542,11 @@ class Simulator:
                         "Volume (bbl)": f"{vol:,.0f}"
                     })
                 
-                # --- START NEW BLOCK (2 of 2) ---
                 # Get the pre-calculated gap for this cargo
                 gap_hours = berth_gaps.get(cargo["vessel_name"], float('nan'))
                 # Format as a string, "N/A" if it was the first cargo
                 berth_gap_str = f"{gap_hours:.2f}" if not math.isnan(gap_hours) else "N/A"
-                # --- END NEW BLOCK (2 of 2) ---
-
+         
                 row = {
                     "Vessel Name": cargo["vessel_name"],
                     "Cargo Type": cargo["cargo_type"],
@@ -1443,7 +1604,7 @@ class Simulator:
         
         # --- START MODIFIED BLOCK (A): FIXED PATH SETUP ---
         # 1. Define fixed output directory relative to the project root
-        output_folder = os.path.expanduser("~/Downloads")
+        output_folder = "/tmp"
         os.makedirs(output_folder, exist_ok=True) # Ensure the directory exists
         
         # 2. Define fixed file paths (no timestamp)
@@ -1470,15 +1631,20 @@ class Simulator:
         
         # Snapshot log (uses 'w' mode, ensuring overwrite)
         if hasattr(self, 'snapshot_log') and self.snapshot_log:
-            with open(snapshot_path, "w", newline="", encoding="utf-8") as f:
-                fieldnames = ['Timestamp'] + [f'Tank{i}' for i in range(1, self.N + 1)] + [f'State{i}' for i in range(1, self.N + 1)]
+           with open(snapshot_path, "w", newline="", encoding="utf-8") as f:
+                # --- START FIX: Build fieldnames *only* for active tanks ---
+                fieldnames = ['Timestamp']
+                for i in sorted(list(self.all_tank_ids)):
+                    fieldnames.append(f'Tank{i}')
+                    fieldnames.append(f'State{i}')
+                # --- END FIX ---
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
                 writer.writerows(self.snapshot_log)
         
         # Event log
         fieldnames = ["Timestamp", "Level", "Event", "Tank", "Cargo", "Message"]
-        fieldnames += [f"Tank{i}" for i in range(1, self.N + 1)]
+        fieldnames += [f"Tank{i}" for i in sorted(list(self.all_tank_ids))]
 
         self._sort_log_chronologically()
         
@@ -1490,7 +1656,7 @@ class Simulator:
         # Daily summary
         summary_fields = ["Date", "Opening Stock (bbl)", "cert stk", "uncert stk", "Processing (bbl)", 
                          "Closing Stock (bbl)", "Ready Tanks", "Empty Tanks"]
-        summary_fields += [f"Tank{i}" for i in range(1, self.N + 1)]
+        summary_fields += [f"Tank{i}" for i in sorted(list(self.all_tank_ids))]
         
         with open(summary_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=summary_fields)
@@ -1504,10 +1670,6 @@ class Simulator:
                 writer = csv.DictWriter(f, fieldnames=list(self.cargo_report_rows[0].keys()))
                 writer.writeheader()
                 writer.writerows(self.cargo_report_rows)
-
-       
-
-        # NOTE: The subsequent _convert_to_excel_with_autofit method will also use these fixed paths.
         
 #         # Inventory data for chart
 #         with open(inventory_path, "w", newline="", encoding="utf-8") as f:
@@ -1515,9 +1677,6 @@ class Simulator:
 #             writer.writerow(["Date", "Certified Stock (MMbbl)"])
 #             for dt, inv in self.inventory_data:
 #                 writer.writerow([dt.strftime("%d/%m/%Y"), f"{inv:.3f}"])
-#         
-
-        
        
     def _convert_to_excel_with_autofit(self, log_path, summary_path, cargo_path, inventory_path, snapshot_path):
         """Convert CSV to Excel with auto-fit columns"""
@@ -1577,7 +1736,6 @@ class Simulator:
             print(f"\nSaved Excel files with auto-fit columns:")
             for ef in excel_files:
                 print(f"  - {ef}")
-
 
 # ------------------------- MAIN -------------------------
 if __name__ == "__main__":

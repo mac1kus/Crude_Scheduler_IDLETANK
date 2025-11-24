@@ -7,9 +7,10 @@ FIXED:
 - Proper crude sequencing (no hardcoding)
 - Cargo combinations optimized to match crude mix ratios
 - Suspended tank priority filling
-- FIXED: Proper tank sequencing 12,13,1-11 with correct cycle suffixes
-- FIXED: Certification logic for multiple tanks on correct day
-- TIMING REMOVED: Scheduler handles all arrival times
+- FIXED: Correct tank sequencing (Idle > Empty > Full)
+- FIXED: Correct vacant space logic *only* for idle tanks on their first cycle.
+- FIXED: Reads idleTankData to track initial crude and report final blend.
+- FIX (User): Added custom tank name mapping for logs and solver tasks.
 """
 
 from datetime import datetime, timedelta
@@ -36,11 +37,11 @@ class CrudeMixOptimizer:
         try:
             # Extract parameters
             processing_rate = float(params.get('processingRate', 50000))
-            num_tanks = self._detect_tank_count(params)
+            num_tanks = self._detect_tank_count(params) # This is now correct
             tank_capacity = float(params.get('tankCapacity', 500000))
             report_days = int(params.get('schedulingWindow', 30))
             
-            print(f"SOLVER: Detected {num_tanks} tanks, report window {report_days} days")
+            print(f"SOLVER: Detected {num_tanks} total tanks from params, report window {report_days} days")
 
             # Extract EXACT crude mix requirements
             crude_mix = self._extract_crude_mix(params)
@@ -59,6 +60,7 @@ class CrudeMixOptimizer:
                 return {'success': False, 'error': 'No vessel types available'}
 
             # Calculate requirements
+            # We pass num_tanks, but _get_empty_tanks is now fixed to use params
             empty_tanks_initial = self._get_empty_tanks(params, num_tanks)
             total_consumption = processing_rate * report_days
             total_needed = total_consumption
@@ -116,7 +118,7 @@ class CrudeMixOptimizer:
             'suezmax': [0, 0.5, 1, 1.5, 2],
             'aframax': [0, 0.25, 0.5, 0.75, 1, 1.25],
             'panamax': [0, 0.25, 0.5, 0.75, 1],
-            'handymax': [0, 0.1, 0.2, 0.3, 0.4, 0.5]
+            'handymax': [0, 0.25, 0.5, 0.75, 1, 1.5, 2, 3]
         }
         
         best_combination = None
@@ -169,10 +171,48 @@ class CrudeMixOptimizer:
         """Pre-allocate tanks with EXACT crude volumes for perfect blending"""
         tank_allocations = []
 
+        # --- START FIX: Create Tank Name Map ---
+        id_to_name_map = {}
+        # Detect all possible tank IDs from the params
+        all_tank_keys = [key for key in params.keys() if key.startswith('tank') and key.endswith('Level')]
+        all_tank_ids = set()
+        for key in all_tank_keys:
+            try:
+                all_tank_ids.add(int(key.replace('tank', '').replace('Level', '')))
+            except ValueError:
+                continue
+        
+        # Also include tanks from 1 to num_tanks (in case they are new)
+        for i in range(1, num_tanks + 1):
+            all_tank_ids.add(i)
+
+        for tank_id in all_tank_ids:
+            # Get the custom name (e.g., "201") from the params dictionary
+            custom_name = params.get(f"tank{tank_id}Name")
+            if not custom_name:
+                custom_name = f"Tank {tank_id}" # Default if name is empty
+            id_to_name_map[tank_id] = custom_name
+        
+        # This map (id_to_name_map) now holds {1: "101", 14: "201", ...}
+        # --- END FIX ---
+
+        # --- START FIX: Load Idle Tank Crude Data ---
+        idle_crude_map = {} # {41: [{'name': 'Crude A', 'volume': 100000}]}
+        idle_tank_data = params.get('idleTankData', [])
+        for tank_data in idle_tank_data:
+            try:
+                tank_id = int(tank_data.get('sequentialId'))
+                if tank_id and tank_data.get('initialCrudes'):
+                    idle_crude_map[tank_id] = tank_data['initialCrudes']
+            except (ValueError, TypeError):
+                continue
+        print(f"SOLVER: Found initial crude data for idle tanks: {list(idle_crude_map.keys())}")
+        # --- END FIX ---
+
         dead_bottom_base = float(params.get('deadBottom1', 10000))
         buffer_volume = float(params.get('bufferVolume', 500))
         dead_bottom_operational = dead_bottom_base + buffer_volume / 2
-        usable_capacity = tank_capacity - dead_bottom_operational
+        usable_capacity = tank_capacity - dead_bottom_operational # This is 589,750
         
         tanks_needed_to_fill = math.ceil(total_needed / usable_capacity) + 5
         
@@ -180,14 +220,53 @@ class CrudeMixOptimizer:
         print(f"Total crude required: {total_needed:,.0f} bbl. Usable capacity per tank: {usable_capacity:,.0f} bbl.")
         print(f"This will require filling {tanks_needed_to_fill} tanks over {report_days} days.")
         
-        # Create dynamic repeating sequence
-        empty_tanks_sorted = sorted(empty_tanks_initial)
-        all_tanks = set(range(1, num_tanks + 1))
-        empty_tanks_set = set(empty_tanks_initial)
-        occupied_tanks = all_tanks - empty_tanks_set
-        occupied_tanks_sorted = sorted(list(occupied_tanks))
-        dynamic_repeating_sequence = empty_tanks_sorted + occupied_tanks_sorted
-        print(f"INFO: Dynamic repeating sequence created: {dynamic_repeating_sequence}")
+        # --- START FIX: Correct Tank Categorization and Sequencing ---
+        
+        # 1. Define thresholds based on operational floor
+        operational_floor = dead_bottom_base + buffer_volume / 2
+
+        # 2. Get the definitive set of IDLE tanks from the UI data
+        idle_partial_tanks_set = set(idle_crude_map.keys())
+        idle_partial_tanks = sorted(list(idle_partial_tanks_set))
+
+        # 3. Find and categorize ALL other tanks
+        empty_tanks = []
+        occupied_full_tanks = []
+
+        all_tank_keys = [key for key in params.keys() if key.startswith('tank') and key.endswith('Level')]
+
+        for key in all_tank_keys:
+            try:
+                tank_id = int(key.replace('tank', '').replace('Level', ''))
+                
+                # If this is an IDLE tank, we already handled it. Skip.
+                if tank_id in idle_partial_tanks_set:
+                    continue
+                    
+                tank_level = float(params.get(key, 0))
+
+                if tank_level <= operational_floor + 100: # Treat as Empty
+                    empty_tanks.append(tank_id)
+                else: 
+                    # This is an Occupied/Full tank (like Tank 12, even if edited)
+                    occupied_full_tanks.append(tank_id)
+            
+            except ValueError:
+                continue
+        
+        print(f"SOLVER: Found {len(idle_partial_tanks)} Idle/Partial tanks (from UI): {sorted(idle_partial_tanks)}")
+        print(f"SOLVER: Found {len(empty_tanks)} Empty tanks: {sorted(empty_tanks)}")
+        print(f"SOLVER: Found {len(occupied_full_tanks)} Occupied/Full tanks: {sorted(occupied_full_tanks)}")
+
+        # 4. Create the correct fill sequence (Idle first, then Empty, then Full)
+        dynamic_repeating_sequence = sorted(idle_partial_tanks) + sorted(empty_tanks) + sorted(occupied_full_tanks)
+        
+        # --- START FIX: Translate sequence to names for logging ---
+        translated_sequence = [id_to_name_map.get(tank_id, f"Tank {tank_id}") for tank_id in dynamic_repeating_sequence]
+        print(f"INFO: Corrected dynamic repeating sequence created: {translated_sequence}")
+        # --- END FIX ---
+        
+        # --- END FIX ---
 
         # Build complete tank pool
         final_tank_id_pool = []
@@ -206,104 +285,246 @@ class CrudeMixOptimizer:
                     final_tank_id_pool.append(tank_id_with_suffix)
             current_cycle += 1
         
-        print(f"DEBUG: Tank sequence generated (first 20): {final_tank_id_pool[:20]}")
+        # --- START FIX: Translate pool to names for logging ---
+        def translate_pool_id(id_val):
+            id_str = str(id_val)
+            cycle_suffix = ""
+            if "(" in id_str:
+                parts = id_str.split('(')
+                base_id_str = parts[0].replace('TK', '')
+                cycle_suffix = f"({parts[1]}"
+            else:
+                base_id_str = id_str
+            
+            try:
+                base_id_int = int(base_id_str)
+                custom_name = id_to_name_map.get(base_id_int, f"Tank {base_id_int}")
+                return f"{custom_name}{cycle_suffix}"
+            except ValueError:
+                return str(id_val) # Fallback
+
+        translated_pool = [translate_pool_id(tid) for tid in final_tank_id_pool[:20]]
+        print(f"DEBUG: Tank sequence generated (first 20): {translated_pool}")
+        # --- END FIX ---
+
+        # --- START FIX: Calculate Vacant Space *ONLY* for Idle Tanks on First Cycle ---
+        
+        # Keep track of which base tanks we've seen in the sequence
+        seen_base_tanks = set()
 
         for i in range(tanks_needed_to_fill):
-            tank_id = final_tank_id_pool[i]
+            tank_id_full = final_tank_id_pool[i] # This might be '14' or 'TK14(1)'
+            
+            # Determine the base ID and if this is the first cycle
+            base_tank_id_str = str(tank_id_full).split('(')[0].replace('TK', '')
+            base_tank_id = int(base_tank_id_str) # This is 14
+            
+            is_first_cycle = base_tank_id not in seen_base_tanks
+            seen_base_tanks.add(base_tank_id)
+
+            # --- START FIX: Get Custom Name for LOGS, but use ORIGINAL ID for DATA ---
+            id_str = str(tank_id_full)
+            cycle_suffix = ""
+            if "(" in id_str:
+                parts = id_str.split('(')
+                # base_id_str is already calculated above
+                cycle_suffix = f"({parts[1]}"
+            
+            # 1. Get the custom name for logging (e.g., "201")
+            custom_name = id_to_name_map.get(base_tank_id, f"Tank {base_tank_id}")
+            translated_tank_id_for_LOGS = f"{custom_name}{cycle_suffix}"
+            
+            # 2. Use the ORIGINAL ID for data (e.g., '14' or 'TK14(1)')
+            #    This is what scheduler.py expects.
+            original_tank_id_for_DATA = tank_id_full
+            # --- END FIX ---
+
+            # --- THIS IS THE KEY LOGIC ---
+            # 1. By default, all planned fills are for the full usable_capacity.
+            fillable_capacity_for_this_cycle = usable_capacity 
+            
+            # 2. BUT... if it's the first cycle AND the tank is an IDLE tank...
+            if is_first_cycle:
+                if base_tank_id in idle_partial_tanks_set:
+                    # 3. THEN we overwrite the capacity with its specific vacant space.
+                    tank_level = float(params.get(f'tank{base_tank_id}Level', 0))
+                    current_usable_volume = max(0, tank_level - dead_bottom_operational)
+                    vacant_space = usable_capacity - current_usable_volume
+                    
+                    fillable_capacity_for_this_cycle = vacant_space 
+                    
+                    # --- FIX: Use map for logging ---
+                    print(f"SOLVER: Tank {id_to_name_map.get(base_tank_id)} (Idle) has {current_usable_volume:,.0f} bbl. Vacant space to fill: {vacant_space:,.0f} bbl.")
+                
+                elif base_tank_id in occupied_full_tanks:
+                    # 4. This tank is a FILLED tank. 
+                    # --- FIX: Use map for logging ---
+                    print(f"SOLVER: Tank {id_to_name_map.get(base_tank_id)} (Filled) first cycle plan is for full {usable_capacity:,.0f} bbl.")
+                
+                else: # This is an EMPTY tank
+                    # 5. This is an EMPTY tank.
+                    # --- FIX: Use map for logging ---
+                    print(f"SOLVER: Tank {id_to_name_map.get(base_tank_id)} (Empty) first cycle plan is for full {usable_capacity:,.0f} bbl.")
+            # --- END KEY LOGIC ---
             
             tank_allocation = {
-                'tank_id': tank_id,
+                'tank_id': original_tank_id_for_DATA, # <-- FIX: Use the ORIGINAL ID
                 'total_capacity': tank_capacity,
-                'usable_capacity': usable_capacity,
+                'usable_capacity': fillable_capacity_for_this_cycle, # Use the calculated capacity
                 'crude_volumes': {}
             }
             
+            # --- START FIX: Pre-populate tank_allocation with existing crudes ---
+            if is_first_cycle and base_tank_id in idle_crude_map:
+                existing_crudes = idle_crude_map[base_tank_id]
+                for crude in existing_crudes:
+                    crude_name = crude.get('name', 'Unknown')
+                    crude_vol = float(crude.get('volume', 0))
+                    if crude_vol > 0:
+                        tank_allocation['crude_volumes'][crude_name] = {
+                            'target_volume': crude_vol, # This is what's already there
+                            'target_percentage': 0, # It's not part of the *new* mix target
+                            'filled_volume': crude_vol, # Mark as "filled"
+                            'source_cargoes': ['InitialStock']
+                        }
+            # --- END FIX ---
+
             for crude_key, crude_data in crude_mix.items():
                 crude_percentage = crude_data['percentage']
-                volume_per_tank = usable_capacity * crude_percentage
+                # Base the volume on the available fillable capacity for *this* cycle
+                volume_per_tank = fillable_capacity_for_this_cycle * crude_percentage 
+                
+                # Add this new crude to the plan
+                # Use .get() in case the crude name already exists from InitialStock (though unlikely)
+                existing_vol_details = tank_allocation['crude_volumes'].get(crude_data['name'], {})
                 
                 tank_allocation['crude_volumes'][crude_data['name']] = {
-                    'target_volume': volume_per_tank,
-                    'target_percentage': crude_percentage * 100,
-                    'filled_volume': 0,
-                    'source_cargoes': []
+                    'target_volume': existing_vol_details.get('target_volume', 0) + volume_per_tank,
+                    'target_percentage': crude_percentage * 100, # This is the % of the *new fill*
+                    'filled_volume': existing_vol_details.get('filled_volume', 0),
+                    'source_cargoes': existing_vol_details.get('source_cargoes', [])
                 }
                 
             if i < 20:
-                print(f"\nTank {tank_id} Dynamic Volume Allocation:")
-                for crude_data in crude_mix.values():
-                    volume = tank_allocation['crude_volumes'][crude_data['name']]['target_volume']
-                    percentage = tank_allocation['crude_volumes'][crude_data['name']]['target_percentage']
-                    print(f"  {crude_data['name']}: {volume:,.0f} bbl ({percentage:.1f}%)")
+                print(f"\nTank {translated_tank_id_for_LOGS} Dynamic Volume Allocation (Fillable: {fillable_capacity_for_this_cycle:,.0f} bbl):")
+                total_allocated = 0
+                for crude_name, details in tank_allocation['crude_volumes'].items():
+                    volume = details['target_volume']
+                    total_allocated += volume
+                    if 'InitialStock' in details['source_cargoes']:
+                        print(f"  {crude_name}: {volume:,.0f} bbl (Initial Stock)")
+                    else:
+                        percentage = details['target_percentage']
+                        print(f"  {crude_name}: {volume:,.0f} bbl ({percentage:.1f}% of new fill)")
                 
-                total_allocated = sum(details['target_volume'] for details in tank_allocation['crude_volumes'].values())
-                print(f"  Total allocated: {total_allocated:,.0f} bbl (should equal {usable_capacity:,.0f} bbl)")
+                print(f"  Total in tank: {total_allocated:,.0f} bbl")
             
             tank_allocations.append(tank_allocation)
+        # --- END FIX ---
         
         self.tank_allocations = tank_allocations
         self.tank_sequence = final_tank_id_pool
         return tank_allocations
 
     def _iterative_cargo_optimization(self, params, vessels, crude_mix, tank_plan, total_needed, optimal_vessel_pattern):
-        """Iterative optimization to achieve EXACT crude ratios"""
+        """
+        Iterative optimization with FEEDBACK LOOP to improve ratios.
+        Now re-calculates vessel pattern each time based on previous errors.
+        """
         max_iterations = 10
         tolerance = 0.001  # 0.1% tolerance
         
         best_schedule = None
         best_deviation = float('inf')
         
-        print(f"\nITERATIVE OPTIMIZATION:")
+        # Base targets (The actual refinery requirement)
+        base_ratios = [c['percentage'] for c in crude_mix.values()]
+        crude_names = [c['name'] for c in crude_mix.values()]
+        
+        # Dynamic targets (We adjust these to steer the solver)
+        current_target_ratios = list(base_ratios)
+        current_vessel_pattern = optimal_vessel_pattern
+        
+        print(f"\nITERATIVE OPTIMIZATION (With Feedback Loop):")
         print("="*80)
         
         for iteration in range(max_iterations):
             print(f"\nIteration {iteration + 1}:")
+            print(f"  Adjusted Target Ratios: {[f'{r*100:.1f}%' for r in current_target_ratios]}")
             print("-"*80)
             
-            # Calculate exact crude volumes needed based on the comprehensive tank plan
+            # STEP 1: Re-calculate optimal vessel pattern based on adjusted targets
+            # (Skip for first iteration to use the initial seed)
+            if iteration > 0:
+                new_pattern = self._find_optimal_vessel_combination(vessels, current_target_ratios, crude_names)
+                if new_pattern:
+                    current_vessel_pattern = new_pattern
+                    print(f"  New Vessel Pattern Selected: {current_vessel_pattern}")
+                else:
+                    print("  (Kept previous vessel pattern)")
+
+            # STEP 2: Calculate exact crude volumes needed based on tank plan
             crude_requirements = defaultdict(float)
             for tank in tank_plan:
                 for crude_name, details in tank['crude_volumes'].items():
-                    crude_requirements[crude_name] += details['target_volume']
+                    if 'InitialStock' not in details.get('source_cargoes', []):
+                        crude_requirements[crude_name] += details['target_volume']
 
-            # Generate cargo schedule using optimal vessel pattern
+            # STEP 3: Generate schedule using current pattern
             schedule = self._generate_optimal_cargo_mix(
-                params, vessels, crude_requirements, iteration, optimal_vessel_pattern, total_needed
+                params, vessels, crude_requirements, iteration, current_vessel_pattern, total_needed
             )
             
-            # Calculate actual ratios
+            # STEP 4: Calculate Actual Results
             total_by_crude = defaultdict(float)
             for cargo in schedule:
                 total_by_crude[cargo['crude_name']] += cargo['size']
             
             total_volume = sum(total_by_crude.values())
             
-            # Check deviation from target
+            # STEP 5: Analyze Deviation & Update Best Result
             print(f"\nDEVIATION ANALYSIS:")
-            print("-"*80)
             max_deviation = 0
-            for crude_name, target_pct in [(c['name'], c['percentage']) for c in crude_mix.values()]:
+            current_actual_ratios = []
+            
+            for i, crude_name in enumerate(crude_names):
+                target_pct = base_ratios[i] # Always compare against REAL base requirement
                 actual_pct = total_by_crude[crude_name] / total_volume if total_volume > 0 else 0
+                current_actual_ratios.append(actual_pct)
+                
                 deviation = abs(actual_pct - target_pct)
                 max_deviation = max(max_deviation, deviation)
+                
                 status = "✓ OK" if deviation < 0.01 else "⚠ WARNING"
-                print(f"  {crude_name:20s}: Target={target_pct*100:6.2f}%  Actual={actual_pct*100:6.2f}%  Deviation={deviation*100:6.3f}%  {status}")
-            print(f"-"*80)
-            print(f"MAXIMUM DEVIATION: {max_deviation*100:.3f}%")
-            print("="*80)
+                print(f"  {crude_name:20s}: Target={target_pct*100:6.2f}%  Actual={actual_pct*100:6.2f}%  Diff={deviation*100:6.3f}%  {status}")
             
             if max_deviation < best_deviation:
                 best_schedule = schedule
                 best_deviation = max_deviation
             
-            # Check if we achieved target
             if max_deviation <= tolerance:
                 print(f"\n✓✓✓ SUCCESS: Achieved target ratios within {tolerance*100}% tolerance! ✓✓✓\n")
                 break
             
-            # Adjust for next iteration
+            # STEP 6: Feedback Loop (Adjust targets for next run)
+            # If Actual > Base, we lower the target. If Actual < Base, we raise it.
             if iteration < max_iterations - 1:
-                print(f"\n⚠ Deviation {max_deviation*100:.3f}% > tolerance {tolerance*100}%, refining...\n")
+                print(f"\n  >> Adjusting targets to compensate for {max_deviation*100:.2f}% deviation...")
+                
+                new_targets = []
+                for i in range(len(base_ratios)):
+                    base = base_ratios[i]
+                    actual = current_actual_ratios[i]
+                    error = actual - base
+                    
+                    # Correction: Subtract the error from the target (Adaptive P-Controller)
+                    # Factor 0.8 provides stability so we don't overshoot
+                    adjusted_target = current_target_ratios[i] - (error * 0.8)
+                    new_targets.append(max(0.001, adjusted_target)) # Prevent negative/zero
+                
+                # Normalize back to 100%
+                total_new = sum(new_targets)
+                current_target_ratios = [t / total_new for t in new_targets]
         
         if best_schedule:
             return self._format_final_schedule(params, best_schedule, crude_mix, tank_plan)
@@ -346,7 +567,7 @@ class CrudeMixOptimizer:
                     if multiplier >= 1:
                         vessel_sequence.extend([vessel_type] * int(multiplier))
                     else:
-                        if multiplier >= 0.5:
+                        if multiplier >= 0.1:
                             vessel_sequence.append(vessel_type)
         
         if not vessel_sequence:
@@ -371,7 +592,12 @@ class CrudeMixOptimizer:
         vessel_index = 0
         total_scheduled_volume = 0
         
-        while total_scheduled_volume < total_needed:
+        # --- FIX: Use the calculated total_needed, not the raw one ---
+        total_needed_to_purchase = sum(crude_requirements.values())
+        print(f"SOLVER: Total crude to purchase (excluding initial stock): {total_needed_to_purchase:,.0f} bbl")
+        
+        while total_scheduled_volume < total_needed_to_purchase:
+        # --- END FIX ---
             if cargo_id > 200:
                 print("WARNING: Exceeded 200 cargo limit. Finalizing schedule.")
                 break
@@ -394,7 +620,7 @@ class CrudeMixOptimizer:
                 
             tank_to_fill = tank_plan[current_tank_idx]['tank_id']
             current_total_volume = sum(c['size'] for c in schedule)
-            remaining_needed = total_needed - current_total_volume
+            remaining_needed = total_needed_to_purchase - current_total_volume
             cargo_size_to_schedule = min(vessel_data['capacity'], remaining_needed)
 
             if cargo_size_to_schedule < 1000:
@@ -422,19 +648,51 @@ class CrudeMixOptimizer:
                 
                 if tank_id not in tank_states:
                     tank_states[tank_id] = {c: 0 for c in crude_names}
+                    # --- FIX: Account for InitialStock in tank_states ---
+                    if 'crude_volumes' in tank_plan[tank_idx]:
+                        for cn, details in tank_plan[tank_idx]['crude_volumes'].items():
+                            if 'InitialStock' in details.get('source_cargoes', []):
+                                tank_states[tank_id][cn] = details.get('target_volume', 0)
+                    # --- END FIX ---
                     tank_states[tank_id]['status'] = 'empty'
                 
-                target_for_crude = tank_plan[tank_idx]['crude_volumes'].get(crude_name, {}).get('target_volume', 0)
+                # --- FIX: Account for Initial Stock in target ---
+                crude_details = tank_plan[tank_idx]['crude_volumes'].get(crude_name, {})
+                target_for_crude = crude_details.get('target_volume', 0)
+                
+                # Subtract any initial stock *of the same crude type*
+                initial_stock_volume = 0
+                if 'InitialStock' in crude_details.get('source_cargoes', []):
+                    # Check if the initial stock is of the *same crude* we are filling
+                    if crude_name == cn: 
+                        initial_stock_volume = crude_details.get('target_volume', 0)
+                
+                target_to_fill = target_for_crude - initial_stock_volume
+                # --- END FIX ---
+
                 current_in_tank = tank_states[tank_id].get(crude_name, 0)
-                needed = target_for_crude - current_in_tank
+                # If tank has initial stock, current_in_tank is already set
+                if initial_stock_volume > 0:
+                    current_in_tank = initial_stock_volume
+
+                needed = target_to_fill - (current_in_tank - initial_stock_volume) # Need = target_to_fill - already_filled_by_cargoes
                 
                 if needed > 0:
                     volume_to_add = min(needed, cargo_vol_remaining)
                     tank_states[tank_id][crude_name] += volume_to_add
                     cargo_vol_remaining -= volume_to_add
                     
-                    total_in_tank = sum(tank_states[tank_id].get(c, 0) for c in crude_names)
-                    if total_in_tank >= usable_capacity * 0.99:
+                    # --- FIX: Check against the tank's *specific* usable capacity ---
+                    tank_usable_capacity = tank_plan[tank_idx].get('usable_capacity', usable_capacity)
+                    
+                    # --- FIX: Total in tank must include ALL crudes, even initial ---
+                    total_in_tank = sum(tank_states[tank_id].get(c, 0) for c in tank_states[tank_id] if c != 'status')
+                    
+                    # Get the *full* capacity of the tank plan (e.g. 589,750), not the fillable (489,750)
+                    full_planned_capacity = sum(details.get('target_volume', 0) for details in tank_plan[tank_idx]['crude_volumes'].values())
+
+                    if total_in_tank >= full_planned_capacity * 0.99:
+                    # --- END FIX ---
                         tank_states[tank_id]['status'] = 'complete'
             
             print(f"  QUEUED CARGO {cargo_id}: {vessel_type.upper()}-V{cargo_id:03d}, {cargo_size_to_schedule:,.0f} bbl of {crude_name}")
@@ -459,13 +717,36 @@ class CrudeMixOptimizer:
                 print(f"  {vessel_type}: {count} cargoes")
         print(f"{'='*80}")
         
-        print(f"\nFINAL TANK STATUS:")
-        for tank_id in sorted(tank_states.keys(), key=lambda x: (isinstance(x, str), x)):
-            tank_data = tank_states[tank_id]
-            status = tank_data.get('status', 'unknown')
-            total_vol = sum(tank_data[crude] for crude in crude_names if crude in tank_data)
-            crude_breakdown = [f"{crude}:{tank_data.get(crude, 0):,.0f}" for crude in crude_names]
-            print(f"Tank {tank_id}: {total_vol:,.0f} bbl ({status}) [{', '.join(crude_breakdown)}]")
+        print(f"\nFINAL TANK STATUS (SIMULATED):")
+        for tank_id_full in [t['tank_id'] for t in tank_plan[:20]]: # Show first 20 planned
+            tank_data = tank_states.get(tank_id_full, {})
+            status = tank_data.get('status', 'not_filled')
+            total_vol = sum(tank_data[crude] for crude in tank_data if crude != 'status')
+            
+            crude_breakdown = []
+            
+            # Get all crude names that are in the plan or in the tank state
+            all_crudes_in_tank = set(list(tank_plan[0]['crude_volumes'].keys()) + list(tank_data.keys()))
+
+            for crude in all_crudes_in_tank:
+                if crude == 'status':
+                    continue
+                
+                vol = tank_data.get(crude, 0)
+                if vol > 0:
+                    # Check if this was initial stock
+                    initial_stock = False
+                    if 'crude_volumes' in tank_plan[tank_idx]:
+                        details = tank_plan[tank_idx]['crude_volumes'].get(crude, {})
+                        if 'InitialStock' in details.get('source_cargoes', []):
+                            initial_stock = True
+
+                    if initial_stock:
+                        crude_breakdown.append(f"{crude}:{vol:,.0f} (Initial)")
+                    else:
+                        crude_breakdown.append(f"{crude}:{vol:,.0f}")
+
+            print(f"Tank {tank_id_full}: {total_vol:,.0f} bbl ({status}) [{', '.join(crude_breakdown)}]")
         
         return schedule
 
@@ -477,10 +758,16 @@ class CrudeMixOptimizer:
         print(f"\nTANK FILLING SCHEDULE:")
         
         for tank_idx, tank in enumerate(tank_plan):
-            tank_id_display = tank['tank_id'] if isinstance(tank['tank_id'], int) else tank['tank_id']
-            print(f"\nTank {tank_id_display} Filling Plan:")
+            tank_id_display = tank['tank_id'] # This is now the translated name, e.g., "201"
+            print(f"\nTank {tank_id_display} Filling Plan (Target Usable: {tank['usable_capacity']:,.0f} bbl):")
             
             for crude_name, crude_details in tank['crude_volumes'].items():
+                # --- FIX: Do not schedule filling for InitialStock ---
+                if 'InitialStock' in crude_details.get('source_cargoes', []):
+                    print(f"  Skipping {crude_name}: {crude_details.get('target_volume', 0):,.0f} bbl (Initial Stock)")
+                    continue
+                # --- END FIX ---
+                
                 target_volume = crude_details['target_volume']
                 filled_volume = 0
                 
@@ -498,18 +785,21 @@ class CrudeMixOptimizer:
                     
                     if volume_to_take > 100:
                         filling_schedule.append({
-                            'tank_id': tank['tank_id'],
+                            'tank_id': tank['tank_id'], # Use the translated name
                             'cargo_id': cargo['cargo_id'],
                             'vessel_name': cargo['vessel_name'],
                             'crude_type': crude_name,
                             'volume': volume_to_take,
-                            'percentage_of_tank': (volume_to_take / tank['usable_capacity']) * 100
+                            'percentage_of_tank': (volume_to_take / tank['usable_capacity']) * 100 if tank['usable_capacity'] > 0 else 0,
+                            'source_cargoes': crude_details.get('source_cargoes', []) # Pass this info
                         })
                         
                         cargo_volumes[cargo['cargo_id']] -= volume_to_take
                         filled_volume += volume_to_take
                         
-                        print(f"  {cargo['vessel_name']} -> {volume_to_take:,.0f} bbl {crude_name} ({(volume_to_take/tank['usable_capacity']*100):.1f}% of tank)")
+                        # Use tank's usable_capacity for percentage calculation
+                        tank_fill_pct = (volume_to_take / tank['usable_capacity']) * 100 if tank['usable_capacity'] > 0 else 0
+                        print(f"  {cargo['vessel_name']} -> {volume_to_take:,.0f} bbl {crude_name} ({tank_fill_pct:.1f}% of this cycle's fill)")
                 
                 if filled_volume < target_volume * 0.95:
                     print(f"  WARNING: Could only plan to fill {filled_volume:,.0f}/{target_volume:,.0f} bbl of {crude_name} for this tank.")
@@ -533,7 +823,7 @@ class CrudeMixOptimizer:
             total_allocated = 0
             
             for alloc in allocations:
-                tank_id = alloc['tank_id']
+                tank_id = alloc['tank_id'] # This is now the translated name
                 volume = alloc['volume']
                 tank_breakdown[f"Tank_{tank_id}"] = tank_breakdown.get(f"Tank_{tank_id}", 0) + volume
                 total_allocated += volume
@@ -585,7 +875,7 @@ class CrudeMixOptimizer:
         print(f"Total Volume: {total_volume:,.0f} bbl")
         print(f"Total Cost: ${total_cost:,.0f}")
         print(f"Cargoes: {len(schedule)}")
-        print("\nFINAL CRUDE MIX ACHIEVED:")
+        print("\nFINAL CRUDE MIX ACHIEVED (Purchased):")
         for crude_name, pct in actual_percentages.items():
             target_pct = next((c['percentage'] * 100 for c in crude_mix.values() if c['name'] == crude_name), 0)
             status = "[OK]" if abs(pct - target_pct) < 0.5 else "[WARN]"
@@ -614,19 +904,35 @@ class CrudeMixOptimizer:
         }
 
     def _format_tank_distribution(self, tank_plan, actual_percentages):
-        """Format tank distribution for output"""
+        """Format tank distribution for output
+        FIXED: Correctly calculates percentages for tanks with initial crude.
+        """
         distribution = {}
         
         for tank_idx, tank in enumerate(tank_plan):  
-            tank_id_display = tank['tank_id'] if isinstance(tank['tank_id'], int) else tank['tank_id']
+            tank_id_display = tank['tank_id'] # This is now the translated name
             tank_name = f"Tank_{tank_id_display}"
             distribution[tank_name] = {}
             
+            # --- START FIX ---
+            # Calculate the *true* total volume in this tank
+            true_total_volume = 0
             for crude_name, details in tank['crude_volumes'].items():
+                # 'target_volume' holds the final volume for each crude
+                true_total_volume += details.get('target_volume', 0)
+            
+            if true_total_volume == 0:
+                true_total_volume = 1 # Avoid division by zero
+
+            for crude_name, details in tank['crude_volumes'].items():
+                final_volume = details.get('target_volume', 0)
+                final_percentage = (final_volume / true_total_volume) * 100
+                
                 distribution[tank_name][crude_name] = {
-                    'volume': round(details['target_volume'], 0),
-                    'percentage': round(details['target_percentage'], 1)
+                    'volume': round(final_volume, 0),
+                    'percentage': round(final_percentage, 1)
                 }
+            # --- END FIX ---
         
         return distribution
 
@@ -641,9 +947,13 @@ class CrudeMixOptimizer:
                 except ValueError:
                     continue
         
+        # --- FIX: Use the MAX tank number found, even if it's '95' ---
         detected_max = max(tank_numbers) if tank_numbers else 0
-        param_tanks = int(params.get('numTanks', 12))
-        return max(detected_max, param_tanks)
+        param_tanks_ui = int(params.get('numTanks', 12))
+        
+        # We return the detected_max so that all tanks (1-13 and 41) are "known"
+        # The sequencing logic will handle the order.
+        return max(detected_max, param_tanks_ui)
 
     def _extract_crude_mix(self, params):
         """Extract crude mix configuration"""
@@ -694,20 +1004,44 @@ class CrudeMixOptimizer:
     def _calculate_initial_inventory(self, params, num_tanks):
         """Calculate initial inventory"""
         total = 0
-        for i in range(1, num_tanks + 1):
-            tank_level = float(params.get(f'tank{i}Level', 0))
-            dead_bottom = float(params.get(f'deadBottom{i}', 10000))
-            total += max(0, tank_level - dead_bottom)
+        # --- FIX: Loop over actual keys, not 1-num_tanks ---
+        all_tank_keys = [key for key in params.keys() if key.startswith('tank') and key.endswith('Level')]
+        for key in all_tank_keys:
+            try:
+                tank_id = int(key.replace('tank', '').replace('Level', ''))
+                tank_level = float(params.get(key, 0))
+                dead_bottom_key = f'deadBottom{tank_id}'
+                dead_bottom_default = params.get('deadBottom1', 10000)
+                dead_bottom = float(params.get(dead_bottom_key, dead_bottom_default))
+                total += max(0, tank_level - dead_bottom)
+            except (ValueError, TypeError):
+                continue
         return total
 
     def _get_empty_tanks(self, params, num_tanks):
-        """Get list of empty tanks"""
+        """Get list of empty tanks by checking ONLY keys present in params."""
+        # This function is now only used to seed the sequence.
+        # The main logic in _allocate_tanks_for_blend does the real categorization.
         empty = []
-        for i in range(1, num_tanks + 1):
-            tank_level = float(params.get(f'tank{i}Level', 0))
-            dead_bottom = float(params.get(f'deadBottom{i}', 10000))
+        
+        all_tank_keys = [key for key in params.keys() if key.startswith('tank') and key.endswith('Level')]
+
+        for key in all_tank_keys:
+            try:
+                tank_id = int(key.replace('tank', '').replace('Level', ''))
+            except ValueError:
+                continue 
+            
+            tank_level = float(params.get(key, 0))
+            
+            dead_bottom_key = f'deadBottom{tank_id}'
+            dead_bottom_default = params.get('deadBottom1', 10000)
+            dead_bottom = float(params.get(dead_bottom_key, dead_bottom_default))
+            
             if tank_level <= dead_bottom + 500:
-                empty.append(i)
+                empty.append(tank_id)
+                
+        print(f"SOLVER: _get_empty_tanks found: {empty}")
         return empty
 
     def _get_processing_start_datetime(self, params):
