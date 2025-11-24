@@ -1,5 +1,5 @@
 import dash
-from dash import dcc, html, Input, Output, State, dash_table
+from dash import dcc, html, Input, Output, State, dash_table,callback_context
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
@@ -79,28 +79,17 @@ def load_data():
         'snapshot_df': 'tank_snapshots*.csv'
     }
     
+    # 1. Determine Source
     if os.path.exists(folder_path):
-        for df_name, pattern in file_patterns.items():
-            matching_files = [f for f in os.listdir(folder_path) if f.endswith('.csv') and pattern.replace('*', '') in f]
-            
-            if matching_files:
-                latest_file = sorted(matching_files)[-1]
-                filepath = os.path.join(folder_path, latest_file)
-                
-                try:
-                    dataframes[df_name] = safe_read_csv(filepath)
-                except Exception as e:
-                    print(f"Error loading {df_name}: {e}")
-                    dataframes[df_name] = None
-            else:
-                dataframes[df_name] = None
-        
-        if all(df is None for df in dataframes.values()):
+        has_files = any(len([f for f in os.listdir(folder_path) if p.replace('*','') in f]) > 0 for p in file_patterns.values())
+        if not has_files:
             use_flask = True
     else:
         use_flask = True
     
+    # 2. Download/Load Logic
     if use_flask:
+        print("🌍 Downloading from Backend...")
         endpoints = {
             'summary_df': f"{FLASK_APP_URL}/download/daily_summary.csv", 
             'log_df': f"{FLASK_APP_URL}/download/simulation_log.csv",
@@ -110,92 +99,89 @@ def load_data():
         
         for df_name, url in endpoints.items():
             try:
-                # FIX 2 APPLIED HERE: Timeout increased to 30
                 response = requests.get(url, timeout=30)
                 if response.status_code == 200:
                     csv_data = response.content.decode('utf-8')
                     dataframes[df_name] = pd.read_csv(io.StringIO(csv_data))
-            except requests.exceptions.RequestException as e:
-                print(f"Failed to connect for {df_name}: {e}")
+                    print(f"   ✅ {df_name}: {len(dataframes[df_name])} rows loaded.")
+                else:
+                    dataframes[df_name] = None
+            except Exception as e:
+                print(f"   ❌ Error {df_name}: {e}")
                 dataframes[df_name] = None
-    
+    else:
+        # Local Load: Force pick the largest file to avoid partial logs
+        for df_name, pattern in file_patterns.items():
+            matching_files = [f for f in os.listdir(folder_path) if f.endswith('.csv') and pattern.replace('*', '') in f]
+            if matching_files:
+                # Sort by size (largest first) to ensure we get the full simulation
+                matching_files.sort(key=lambda x: os.path.getsize(os.path.join(folder_path, x)), reverse=True)
+                latest_file = matching_files[0]
+                dataframes[df_name] = safe_read_csv(os.path.join(folder_path, latest_file))
+            else:
+                dataframes[df_name] = None
+
+    # 3. Assign Dataframes
     log_df = dataframes.get('log_df')
     summary_df = dataframes.get('summary_df')
     cargo_df = dataframes.get('cargo_df')
     snapshot_df = dataframes.get('snapshot_df')
     
+    # --- FIX: Ensure Daily Summary has a 'Date' column ---
+    if summary_df is not None:
+        # If 'Date' is missing, check if it's the first unnamed column (index)
+        if 'Date' not in summary_df.columns:
+            first_col = summary_df.columns[0]
+            if 'Unnamed' in str(first_col) or first_col == '':
+                summary_df.rename(columns={first_col: 'Date'}, inplace=True)
+            # If it was set as index
+            elif summary_df.index.name == 'Date':
+                summary_df.reset_index(inplace=True)
+
+    # 4. Get Crude Mix
     if use_flask:
         try:
-            mix_url = f"{FLASK_APP_URL}/api/get_crude_mix"
-            # FIX 2 APPLIED HERE: Timeout increased to 30
-            response = requests.get(mix_url, timeout=30)
-            if response.status_code == 200:
-                data = response.json()
-                if "crude_mix_data" in data and isinstance(data["crude_mix_data"], list):
-                    for item in data["crude_mix_data"]:
-                        crude_mix[item.get("name")] = float(item.get("percentage", 0))
-        except Exception:
-            pass
-    else:
-        if log_df is not None and not log_df.empty:
-            ready_1_events = log_df[log_df['Event'] == 'READY_2']
-            if not ready_1_events.empty:
-                for idx, row in ready_1_events.iterrows():
-                    message = str(row.get('Message', ''))
-                    mix_match = re.search(r'Mix:\s*\[(.*?)\]', message, re.IGNORECASE)
-                    
-                    if mix_match:
-                        mix_str = mix_match.group(1)
-                        for item in mix_str.split(','):
-                            item = item.strip()
-                            crude_pct = re.match(r'([^:]+):\s*([\d.]+)%', item)
-                            if crude_pct:
-                                crude_name = crude_pct.group(1).strip()
-                                pct_value = float(crude_pct.group(2))
-                                crude_mix[crude_name] = pct_value
-    
+            resp = requests.get(f"{FLASK_APP_URL}/api/get_crude_mix", timeout=30)
+            if resp.status_code == 200:
+                data = resp.json()
+                for item in data.get("crude_mix_data", []):
+                    crude_mix[item.get("name")] = float(item.get("percentage", 0))
+        except: pass
+    elif log_df is not None and not log_df.empty:
+        ready_events = log_df[log_df['Event'] == 'READY_2']
+        if not ready_events.empty:
+            for idx, row in ready_events.iterrows():
+                message = str(row.get('Message', ''))
+                mix_match = re.search(r'Mix:\s*\[(.*?)\]', message, re.IGNORECASE)
+                if mix_match:
+                    mix_str = mix_match.group(1)
+                    for item in mix_str.split(','):
+                        item = item.strip()
+                        crude_pct = re.match(r'([^:]+):\s*([\d.]+)%', item)
+                        if crude_pct:
+                             crude_mix[crude_pct.group(1).strip()] = float(crude_pct.group(2))
+
+    # 5. Pre-process Log (ENSURE NO TAIL/LIMIT HERE)
     if log_df is not None:
         try:
             log_df['Timestamp'] = pd.to_datetime(log_df['Timestamp'], format='%d/%m/%Y %H:%M', dayfirst=True)
-        except Exception:
-            try:
-                log_df['Timestamp'] = pd.to_datetime(log_df['Timestamp'], format='%d/%m/%Y %H:%M', dayfirst=True, errors='coerce')
-            except Exception:
-                pass
+        except:
+            log_df['Timestamp'] = pd.to_datetime(log_df['Timestamp'], errors='coerce')
         
         if 'Timestamp' in log_df.columns:
+            # Sort Oldest to Newest
             log_df = log_df.sort_values('Timestamp', ascending=True).reset_index(drop=True)
-        
+
         sim_start = log_df[log_df['Event'] == 'SIM_START']
         if not sim_start.empty:
-            message = sim_start.iloc[0]['Message']
-            rate_match = re.search(r'processing rate:\s*([\d,]+)', str(message))
+            rate_match = re.search(r'processing rate:\s*([\d,]+)', str(sim_start.iloc[0].get('Message', '')))
             if rate_match:
-                try:
-                    processing_rate_html = float(rate_match.group(1).replace(',', ''))
-                except:
-                    pass
-
-    if summary_df is not None:
-        try:
-            summary_df['Date'] = pd.to_datetime(summary_df['Date'], format='%d/%m/%Y', errors='coerce')
-        except Exception:
-            try:
-                summary_df['Date'] = pd.to_datetime(summary_df['Date'], errors='coerce')
-            except Exception:
-                pass
+                processing_rate_html = float(rate_match.group(1).replace(',', ''))
 
     if snapshot_df is not None:
-        first_col = snapshot_df.columns[0]
         try:
-            timestamps = pd.to_datetime(snapshot_df[first_col], format='%d/%m/%Y %H:%M', errors='coerce')
-            if timestamps.isna().all():
-                timestamps = pd.to_datetime(snapshot_df[first_col], errors='coerce')
-            
-            if timestamps.notna().sum() > 0:
-                snapshot_df['_Timestamp'] = timestamps
-        except Exception:
-            pass
+            snapshot_df['_Timestamp'] = pd.to_datetime(snapshot_df.iloc[:, 0], format='%d/%m/%Y %H:%M', dayfirst=True, errors='coerce')
+        except: pass
 
     return log_df, summary_df, cargo_df, snapshot_df, crude_mix, processing_rate_html
 
@@ -408,64 +394,80 @@ def show_debug_info(date_str, time_str, n_clicks):
     return html.Div([html.P(line, style={'margin': '2px'}) for line in debug_lines])
 
 @app.callback(
-    Output('selected-timestamp', 'data'),
-    Input('date-selector', 'value'),
-    Input('time-input', 'value'),
-    Input('refresh-btn', 'n_clicks')
+    [Output('selected-timestamp', 'data'),
+     Output('date-selector', 'options'),
+     Output('date-selector', 'value')],
+    [Input('date-selector', 'value'),
+     Input('time-input', 'value'),
+     Input('refresh-btn', 'n_clicks')],
+    [State('date-selector', 'options')]
 )
-def update_timestamp(date_str, time_str, n_clicks):
-    # GLOBAL VARIABLES: We need to update these inside the callback
-    global log_df, summary_df, cargo_df, snapshot_df, crude_mix, processing_rate, all_tank_ids
+def update_timestamp(date_str, time_str, n_clicks, current_options):
+    # Global variables need to be updated
+    global log_df, summary_df, cargo_df, snapshot_df, crude_mix, processing_rate, all_tank_ids, min_time, max_time
     
-    ctx = dash.callback_context
+    ctx = callback_context
     trigger_id = ctx.triggered[0]['prop_id'].split('.')[0] if ctx.triggered else None
-
-    # LOGIC: If Refresh is clicked OR if we have no tanks (initial load failed)
-    # We try to download the data again.
+    
+    # 1. RELOAD DATA Logic
     if trigger_id == 'refresh-btn' or len(all_tank_ids) == 0:
-        print("🔄 Refresh detected: Attempting to reload data from Backend...")
-        
-        # 1. Call load_data() again
+        print("🔄 Refreshing: Checking Backend for data...")
         new_log, new_sum, new_cargo, new_snap, new_mix, new_rate = load_data()
         
-        # 2. If we got data back, update the global variables
         if new_log is not None or new_snap is not None:
-            print("✅ Data reload successful!")
-            log_df = new_log
-            summary_df = new_sum
-            cargo_df = new_cargo
-            snapshot_df = new_snap
-            crude_mix = new_mix
-            processing_rate = new_rate
-            
-            # 3. Re-calculate tank IDs so the grid can render
+            # Update globals
+            log_df, summary_df, cargo_df, snapshot_df = new_log, new_sum, new_cargo, new_snap
+            crude_mix, processing_rate = new_mix, new_rate
             all_tank_ids = get_all_tank_ids(log_df, snapshot_df)
+            
+            # Recalculate Time Range from the new data
+            if log_df is not None and not log_df.empty:
+                min_time = log_df['Timestamp'].min()
+                max_time = log_df['Timestamp'].max()
+                # FORCE JUMP TO START DATE
+                date_str = min_time.strftime('%Y-%m-%d')
+                print(f"✅ Data loaded. Simulation Start: {date_str}")
+            elif snapshot_df is not None:
+                min_time = snapshot_df['_Timestamp'].min()
+                max_time = snapshot_df['_Timestamp'].max()
+                date_str = min_time.strftime('%Y-%m-%d')
+                print(f"✅ Snapshot loaded. Start: {date_str}")
         else:
-            print("⚠️ Reload attempted but data is still None (Backend might still be waking up).")
+            print("⚠️ Backend connection attempted, but data is empty/None.")
 
-    # --- Standard Timestamp Parsing Logic ---
+    # 2. UPDATE DROPDOWN OPTIONS (To match new data range)
+    # Ensure min_time/max_time are valid (fallback to now if needed)
+    try:
+        if pd.isna(min_time): min_time = datetime.now()
+        if pd.isna(max_time): max_time = datetime.now() + timedelta(days=1)
+    except:
+        min_time = datetime.now()
+        max_time = datetime.now() + timedelta(days=1)
+        
+    new_options = [{'label': d.strftime('%d/%m/%Y'), 'value': d.strftime('%Y-%m-%d')} 
+                   for d in pd.date_range(min_time.date(), max_time.date(), freq='D')]
+
+    # 3. PARSE FINAL TIMESTAMP
     try:
         date_obj = datetime.strptime(date_str, '%Y-%m-%d').date()
         
         time_str = str(time_str).strip()
         time_parts = time_str.replace(':', ' ').replace('-', ' ').split()
-        
         if len(time_parts) >= 2:
-            hour = int(time_parts[0])
-            minute = int(time_parts[1])
+            h, m = int(time_parts[0]), int(time_parts[1])
         elif len(time_parts) == 1 and time_parts[0].isdigit():
-            hour = int(time_parts[0])
-            minute = 0
+            h, m = int(time_parts[0]), 0
         else:
-            hour, minute = 0, 0
+            h, m = 0, 0
+            
+        timestamp = datetime.combine(date_obj, datetime.strptime(f"{h:02d}:{m:02d}", "%H:%M").time())
         
-        time_obj = datetime.strptime(f"{hour:02d}:{minute:02d}", "%H:%M").time()
-        timestamp = datetime.combine(date_obj, time_obj)
+        # Return: Timestamp Data, New Options, New Value (Force Jump)
+        return timestamp.isoformat(), new_options, date_str
         
-        return timestamp.isoformat()
     except Exception as e:
-        print(f"❌ Timestamp error: {e}")
-        return min_time.isoformat()
+        print(f"❌ Date Error: {e}")
+        return min_time.isoformat(), new_options, min_time.strftime('%Y-%m-%d')
 
 @app.callback(
     Output('metrics-row', 'children'),
@@ -626,131 +628,93 @@ def update_tank_grid(timestamp_str):
 
 @app.callback(
     Output('tab-content', 'children'),
-    Input('tabs', 'value'),
-    Input('selected-timestamp', 'data')
+    [Input('tabs', 'value'),
+     Input('selected-timestamp', 'data')]
 )
 def render_tab_content(active_tab, timestamp_str):
-    if active_tab == 'crude-mix':
-        if crude_mix and len(crude_mix) > 0:
-            mix_df = pd.DataFrame([
-                {"Crude Name": crude, "Percentage (%)": value}
-                for crude, value in crude_mix.items()
-            ])
-            
-            fig = go.Figure(data=[go.Pie(
-                labels=list(crude_mix.keys()),
-                values=list(crude_mix.values()),
-                hole=0.3
-            )])
-            fig.update_layout(title='Crude Mix Distribution', height=400)
-            
-            return html.Div([
-                html.H3("🛢️ Crude Mix Composition"),
-                dash_table.DataTable(
-                    data=mix_df.to_dict('records'),
-                    columns=[{"name": i, "id": i} for i in mix_df.columns],
-                    style_table={'overflowX': 'auto'},
-                    style_cell={'textAlign': 'left', 'padding': '10px'},
-                ),
-                dcc.Graph(figure=fig)
-            ])
-        else:
-            return html.Div("No crude mix data available")
-    
-    elif active_tab == 'events':
+    if active_tab == 'events':
         if log_df is not None and not log_df.empty:
-            display_df = log_df.tail(100).copy()
-            display_df['Timestamp'] = display_df['Timestamp'].dt.strftime('%d/%m/%Y %H:%M')
+            display_df = log_df.copy()
+            
+            if 'Timestamp' in display_df.columns:
+                display_df = display_df.sort_values('Timestamp', ascending=True)
+                display_df['Timestamp'] = display_df['Timestamp'].dt.strftime('%d/%m/%Y %H:%M')
             
             cols = ['Timestamp', 'Level', 'Event', 'Tank', 'Message']
             display_cols = [col for col in cols if col in display_df.columns]
             
             return html.Div([
-                html.H3("📋 Recent Events"),
+                html.H3(f"📋 Full Event Log ({len(display_df)} rows)"), 
                 dash_table.DataTable(
                     data=display_df[display_cols].to_dict('records'),
                     columns=[{"name": i, "id": i} for i in display_cols],
-                    style_table={'overflowX': 'auto', 'height': '500px', 'overflowY': 'auto'},
-                    style_cell={'textAlign': 'left', 'padding': '8px', 'fontSize': '12px'},
-                    style_header={'fontWeight': 'bold'},
-                )
-            ])
-        else:
-            return html.Div("No event log available")
-    
-    elif active_tab == 'stock':
-        if snapshot_df is not None and '_Timestamp' in snapshot_df.columns:
-            timestamps = []
-            certified_stocks = []
-            
-            for idx, row in snapshot_df.iterrows():
-                timestamp = row['_Timestamp']
-                certified_stock = 0.0
-                
-                for tank_id in all_tank_ids:
-                    state_col = f'State{tank_id}'
-                    tank_col = f'Tank{tank_id}'
-                    
-                    if state_col in row.index and tank_col in row.index:
-                        state = str(row[state_col]).strip().upper()
-                        
-                        if state in ['READY', 'FEEDING']:
-                            volume_str = str(row[tank_col]).replace(',', '').strip()
-                            try:
-                                volume = float(volume_str)
-                                certified_stock += volume
-                            except:
-                                pass
-                
-                timestamps.append(timestamp)
-                certified_stocks.append(certified_stock / 1_000_000)
-            
-            fig = px.line(
-                x=timestamps,
-                y=certified_stocks,
-                labels={'x': 'Date & Time', 'y': 'Certified Stock (MMbbl)'},
-                title='Certified Stock Timeline'
-            )
-            fig.update_layout(height=500)
-            
-            return html.Div([
-                html.H3("📊 Certified Stock Over Time"),
-                dcc.Graph(figure=fig)
-            ])
-        else:
-            return html.Div("No snapshot data available")
-    
-    elif active_tab == 'cargo':
-        if cargo_df is not None:
-            cargo_display = cargo_df.copy()
-            
-            return html.Div([
-                html.H3("🚢 Cargo Schedule"),
-                dash_table.DataTable(
-                    data=cargo_display.to_dict('records'),
-                    columns=[{"name": i, "id": i} for i in cargo_display.columns],
+                    page_action='native',
+                    page_size=50,
                     style_table={'overflowX': 'auto'},
-                    style_cell={'textAlign': 'left', 'padding': '10px'},
+                    style_cell={'textAlign': 'left', 'padding': '8px', 'minWidth': '100px'},
+                    style_header={'fontWeight': 'bold', 'backgroundColor': '#f3f4f6'},
+                    sort_action='native',
+                    filter_action='native'
                 )
             ])
-        else:
-            return html.Div("No cargo data available")
-    
+        return html.Div("No event log available")
+
     elif active_tab == 'summary':
         if summary_df is not None:
             return html.Div([
-                html.H3("📈 Daily Processing Summary"),
+                html.H3("📈 Daily Summary"),
                 dash_table.DataTable(
                     data=summary_df.to_dict('records'),
+                    # This dynamically grabs columns, so 'Date' will now show up
                     columns=[{"name": i, "id": i} for i in summary_df.columns],
                     style_table={'overflowX': 'auto'},
                     style_cell={'textAlign': 'left', 'padding': '10px'},
+                    page_action='native',
+                    page_size=15
                 )
             ])
-        else:
-            return html.Div("No summary data available")
+        return html.Div("No summary data available")
+        
+    elif active_tab == 'crude-mix':
+        if crude_mix and len(crude_mix) > 0:
+            mix_df = pd.DataFrame([{"Crude Name": c, "Percentage (%)": v} for c, v in crude_mix.items()])
+            fig = go.Figure(data=[go.Pie(labels=list(crude_mix.keys()), values=list(crude_mix.values()), hole=0.3)])
+            fig.update_layout(title='Crude Mix Distribution', height=400)
+            return html.Div([
+                html.H3("🛢️ Crude Mix"),
+                dash_table.DataTable(data=mix_df.to_dict('records'), columns=[{"name": i, "id": i} for i in mix_df.columns]),
+                dcc.Graph(figure=fig)
+            ])
+        return html.Div("No crude mix data available")
+    
+    elif active_tab == 'stock':
+        if snapshot_df is not None and '_Timestamp' in snapshot_df.columns:
+            # Plot 1 out of every 100 points for speed
+            step = max(1, len(snapshot_df) // 100) 
+            plot_df = snapshot_df.iloc[::step].copy()
+            timestamps = []
+            certified_stocks = []
+            for _, row in plot_df.iterrows():
+                c_stock = 0.0
+                for tid in all_tank_ids:
+                    if row.get(f'State{tid}', '').strip().upper() in ['READY', 'FEEDING']:
+                        try: c_stock += float(str(row.get(f'Tank{tid}', '0')).replace(',', ''))
+                        except: pass
+                timestamps.append(row['_Timestamp'])
+                certified_stocks.append(c_stock / 1_000_000)
+            
+            fig = px.line(x=timestamps, y=certified_stocks, title='Certified Stock Timeline')
+            fig.update_layout(height=500)
+            return html.Div([html.H3("📊 Certified Stock"), dcc.Graph(figure=fig)])
+        return html.Div("No snapshot data")
+    
+    elif active_tab == 'cargo':
+         if cargo_df is not None:
+            return html.Div([html.H3("🚢 Cargo Schedule"), dash_table.DataTable(data=cargo_df.to_dict('records'), columns=[{"name": i, "id": i} for i in cargo_df.columns], style_table={'overflowX': 'auto'})])
+         return html.Div("No cargo data")
 
+    return html.Div("Select a tab")
 # Run the app
 if __name__ == '__main__':
-    #app.run(debug=True, port=8051)
-    app.run(debug=True, host='0.0.0.0', port=int(os.environ.get('PORT', 8051)))
+    app.run(debug=True, port=8051)
+    #app.run(debug=True, host='0.0.0.0', port=int(os.environ.get('PORT', 8051)))

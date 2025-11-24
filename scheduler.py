@@ -435,7 +435,7 @@ class Simulator:
         - First Cargo: Checks 'scheduling_mode'.
             - Manual: Use User Date.
             - Solver: Use RANDOM Gap from Start Time (Min/Max).
-        - Subsequent Cargos: Proactive Gap Logic (Rush if low stock).
+        - Subsequent Cargos: Use configured berth_gap_hours (Min/Max range)
         """
         
         berths_checked = set()
@@ -470,27 +470,13 @@ class Simulator:
                 
                 # OPTION B: SOLVER MODE (System calculates RANDOM Start Gap)
                 else:
-                    # CHANGED: Use random.uniform instead of just berth_gap_hours_min
                     first_gap = random.uniform(self.berth_gap_hours_min, self.berth_gap_hours_max)
                     calculated_arrival = self.start + timedelta(hours=first_gap)
 
             # === CASE 2: SUBSEQUENT CARGOS ===
             else:
-                # Check Inventory Health (Proactive Logic)
-                ready_count = self._count_state(READY)
-                feeding_count = self._count_state(FEEDING)
-                total_active = ready_count + feeding_count
-                
-                # If tanks are low, rush the vessel (Min Gap)
-                if total_active <= self.min_ready_tanks:
-                    used_gap = self.berth_gap_hours_min
-                    urgency_msg = " [PROACTIVE: RUSHING]"
-                # If tanks are healthy, use Random Gap
-                else:
-                    used_gap = random.uniform(self.berth_gap_hours_min, self.berth_gap_hours_max)
-                    urgency_msg = ""
-
-                # Calculate arrival relative to when the berth became free
+                # FIX: Always use configured berth gap - NO RUSHING LOGIC
+                used_gap = random.uniform(self.berth_gap_hours_min, self.berth_gap_hours_max)
                 calculated_arrival = berth["free_at"] + timedelta(hours=used_gap)
             
             if now >= calculated_arrival:
@@ -506,21 +492,18 @@ class Simulator:
                     
                     # Log the event
                     if not cargo.get('arrival_logged', False):
-                        is_first = "First" if now == calculated_arrival else "Subsequent" 
-                        if 'urgency_msg' not in locals(): urgency_msg = ""
-                        
                         self._log_event(
                             calculated_arrival, 
                             "Success",
                             "ARRIVAL",
                             None,
                             cargo["vessel_name"],
-                            f"BERTH {cargo['berth']} Cargo Arrived ({self.scheduling_mode.upper()} logic){urgency_msg}. Fill starts {cargo['fill_start'].strftime('%d/%m %H:%M')}"
+                            f"BERTH {cargo['berth']} Cargo Arrived ({self.scheduling_mode.upper()} logic). "
+                            f"Fill starts {cargo['fill_start'].strftime('%d/%m %H:%M')}"
                         )
                         cargo["arrival_logged"] = True
                     
                     continue
-
     def _schedule_cargos_standard(self, now: datetime):
         """Original cargo scheduling logic (random selection)"""
         ready_count = self._count_state(READY)
