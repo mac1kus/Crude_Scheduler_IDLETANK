@@ -12,7 +12,10 @@ import io
 from pathlib import Path
 
 # Configuration
-FLASK_APP_URL = "http://127.0.0.1:5000"
+#FLASK_APP_URL = "http://127.0.0.1:5000"
+
+FLASK_APP_URL = "https://crude-backend-idletank.onrender.com"
+
 PRIMARY_FOLDER = r"G:\tmp"
 FALLBACK_FOLDER = str(Path.home() / "Downloads")
 
@@ -712,4 +715,4 @@ def render_tab_content(active_tab, timestamp_str):
 
 # Run the app
 if __name__ == '__main__':
-    app.run(debug=True, port=8051)
+    app.run(debug=True, host='0.0.0.0', port=int(os.environ.get('PORT', 8051)))
