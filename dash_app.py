@@ -414,10 +414,39 @@ def show_debug_info(date_str, time_str, n_clicks):
     Input('refresh-btn', 'n_clicks')
 )
 def update_timestamp(date_str, time_str, n_clicks):
+    # GLOBAL VARIABLES: We need to update these inside the callback
+    global log_df, summary_df, cargo_df, snapshot_df, crude_mix, processing_rate, all_tank_ids
+    
+    ctx = dash.callback_context
+    trigger_id = ctx.triggered[0]['prop_id'].split('.')[0] if ctx.triggered else None
+
+    # LOGIC: If Refresh is clicked OR if we have no tanks (initial load failed)
+    # We try to download the data again.
+    if trigger_id == 'refresh-btn' or len(all_tank_ids) == 0:
+        print("🔄 Refresh detected: Attempting to reload data from Backend...")
+        
+        # 1. Call load_data() again
+        new_log, new_sum, new_cargo, new_snap, new_mix, new_rate = load_data()
+        
+        # 2. If we got data back, update the global variables
+        if new_log is not None or new_snap is not None:
+            print("✅ Data reload successful!")
+            log_df = new_log
+            summary_df = new_sum
+            cargo_df = new_cargo
+            snapshot_df = new_snap
+            crude_mix = new_mix
+            processing_rate = new_rate
+            
+            # 3. Re-calculate tank IDs so the grid can render
+            all_tank_ids = get_all_tank_ids(log_df, snapshot_df)
+        else:
+            print("⚠️ Reload attempted but data is still None (Backend might still be waking up).")
+
+    # --- Standard Timestamp Parsing Logic ---
     try:
         date_obj = datetime.strptime(date_str, '%Y-%m-%d').date()
         
-        # Parse time - handle multiple formats
         time_str = str(time_str).strip()
         time_parts = time_str.replace(':', ' ').replace('-', ' ').split()
         
@@ -723,5 +752,5 @@ def render_tab_content(active_tab, timestamp_str):
 
 # Run the app
 if __name__ == '__main__':
-    #app.run(debug=True, port=8051)
-    app.run(debug=True, host='0.0.0.0', port=int(os.environ.get('PORT', 8051)))
+    app.run(debug=True, port=8051)
+    #app.run(debug=True, host='0.0.0.0', port=int(os.environ.get('PORT', 8051)))
