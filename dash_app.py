@@ -110,7 +110,8 @@ def load_data():
         
         for df_name, url in endpoints.items():
             try:
-                response = requests.get(url, timeout=5)
+                # FIX 2 APPLIED HERE: Timeout increased to 30
+                response = requests.get(url, timeout=30)
                 if response.status_code == 200:
                     csv_data = response.content.decode('utf-8')
                     dataframes[df_name] = pd.read_csv(io.StringIO(csv_data))
@@ -126,7 +127,8 @@ def load_data():
     if use_flask:
         try:
             mix_url = f"{FLASK_APP_URL}/api/get_crude_mix"
-            response = requests.get(mix_url, timeout=5)
+            # FIX 2 APPLIED HERE: Timeout increased to 30
+            response = requests.get(mix_url, timeout=30)
             if response.status_code == 200:
                 data = response.json()
                 if "crude_mix_data" in data and isinstance(data["crude_mix_data"], list):
@@ -329,8 +331,6 @@ app.layout = html.Div([
         # Debug info
         html.Div(id='debug-info', style={'backgroundColor': '#fffacd', 'padding': '10px', 'marginBottom': '10px', 'borderRadius': '5px'}),
         
-        # NOTE: Diagnostic button and output removed here
-        
         # Time selector
         html.Div([
             html.H3("⏰ Select Time Point", style={'marginBottom': '15px'}),
@@ -398,7 +398,6 @@ def show_debug_info(date_str, time_str, n_clicks):
     debug_lines.append(f"🔄 Refresh clicks: {n_clicks}")
     debug_lines.append(f"📊 Log DF: {'Loaded' if log_df is not None else 'None'} ({len(log_df) if log_df is not None else 0} rows)")
     debug_lines.append(f"📊 Snapshot DF: {'Loaded' if snapshot_df is not None else 'None'} ({len(snapshot_df) if snapshot_df is not None else 0} rows)")
-    # debug_lines.append(f"🏷️ All Tank IDs: {all_tank_ids[:10]}{'...' if len(all_tank_ids) > 10 else ''} (Total: {len(all_tank_ids)})") # REMOVED THIS LINE
     
     if snapshot_df is not None and '_Timestamp' in snapshot_df.columns:
         debug_lines.append(f"✅ Snapshot has _Timestamp column")
@@ -530,11 +529,18 @@ def update_tank_grid(timestamp_str):
         timestamp = pd.to_datetime(timestamp_str)
     
     tank_status = get_tank_status(log_df, snapshot_df, timestamp, all_tank_ids)
-    
     num_tanks = len(all_tank_ids)
     
+    # --- FIX 1 APPLIED HERE: Handle 0 tanks to prevent ZeroDivisionError ---
+    if num_tanks == 0:
+        return html.Div([
+            html.H3("⏳ Connecting to Simulation Backend..."),
+            html.P("Waiting for tank data. If this persists for >1 minute, check Backend logs."),
+            html.P("Note: Render Free Tier servers may take 50s to wake up.")
+        ], style={'backgroundColor': '#fff3cd', 'padding': '20px', 'borderRadius': '10px', 'textAlign': 'center'})
+
     if num_tanks <= 4:
-        cols_per_row = num_tanks
+        cols_per_row = max(1, num_tanks) # Force at least 1 column
     elif num_tanks <= 9:
         cols_per_row = 3
     elif num_tanks <= 16:
@@ -543,6 +549,7 @@ def update_tank_grid(timestamp_str):
         cols_per_row = 5
     else:
         cols_per_row = 6
+    # ---------------------------------------------------------------------
     
     num_rows = math.ceil(num_tanks / cols_per_row)
     
@@ -716,4 +723,5 @@ def render_tab_content(active_tab, timestamp_str):
 
 # Run the app
 if __name__ == '__main__':
+    #app.run(debug=True, port=8051)
     app.run(debug=True, host='0.0.0.0', port=int(os.environ.get('PORT', 8051)))
