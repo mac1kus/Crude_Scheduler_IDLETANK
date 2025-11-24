@@ -38,6 +38,7 @@ STATE_COLORS = {
 
 # Initialize Dash app
 app = dash.Dash(__name__, suppress_callback_exceptions=True)
+server = app.server
 app.title = "Tank Simulation Dashboard"
 
 # Helper functions
