@@ -769,9 +769,17 @@ function collectFormData() {
     const globalInputIds = [
         'processingRate', 'numTanks', 'numFilledTanks', 'numEmptyTanks', 'numIdleTanks',
         'specificIdleTanks', 'tankCapacity', 'pumpingRate', 'crudeMixTolerance',
-        'minInventory', 'maxInventory', 'vlccCapacity', 'minVlccRequired', 'vlccRateDay',
-        'suezmaxCapacity', 'suezmaxRateDay', 'aframaxCapacity', 'aframaxRateDay',
-        'panamaxCapacity', 'panamaxRateDay', 'handymaxCapacity', 'handymaxRateDay',
+        'minInventory', 'maxInventory',
+        
+        // NEW VESSELS ADDED HERE
+        'ulccCapacity','minUlccRequired','ulccRateDay',
+        'vlccCapacity', 'minVlccRequired', 'vlccRateDay',
+        'suezmaxCapacity', 'suezmaxRateDay', 
+        'aframaxCapacity', 'aframaxRateDay',
+        'panamaxCapacity', 'panamaxRateDay', 
+        'handymaxCapacity', 'handymaxRateDay',
+        'handySizeCapacity', 'handySizeRateDay',
+
         'departureMode', 'manualArrivalBerth1', 'manualArrivalBerth2', 'berth_gap_hours_min', 'berth_gap_hours_max',
         'preDischargeDays', 'settlingTime', 'labTestingDays', 'tankFillGapHours', 'tankGapHours',
         'deadBottom1', 'bufferVolume', 'crudeProcessingDate', 'horizonDays', 'horizonHours',
@@ -779,8 +787,11 @@ function collectFormData() {
     ];
 
     const checkboxIds = [
+        // NEW CHECKBOXES ADDED HERE
+        'ulccIncludeReturn',
         'vlccIncludeReturn', 'suezmaxIncludeReturn', 'aframaxIncludeReturn',
-        'panamaxIncludeReturn', 'handymaxIncludeReturn'
+        'panamaxIncludeReturn', 'handymaxIncludeReturn',
+        'handySizeIncludeReturn'
     ];
 
     globalInputIds.forEach(id => {

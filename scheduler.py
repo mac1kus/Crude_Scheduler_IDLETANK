@@ -209,7 +209,7 @@ class Simulator:
             self.bbl[self.active] = min(self.bbl[self.active], self.usable)
             self.feed_start_volume[self.active] = self.bbl[self.active]
             self.tank_feed_start_time[self.active] = self.start
-            feed_log_msg = f"Initial feeding starts from Tank {self._get_display_name(self.active)}"
+            feed_log_msg = f"Initial feeding starts {self._get_display_name(self.active)}"
         else:
             self.active = 0 # No tank is feeding
             feed_log_msg = "No initial feeding tank (Tank 1 is not READY)"
@@ -222,7 +222,7 @@ class Simulator:
         self.active_fills: Dict[str, Tuple[int, datetime, datetime, float]] = {}
 
         # Cargo tracking
-        self.cargo_counter = {"VLCC": 0, "SUEZ": 0, "AFRA": 0, "PANA": 0, "HANDY": 0}
+        self.cargo_counter = {"ULCC": 0, "VLCC": 0, "SUEZ": 0, "AFRA": 0, "PANA": 0, "HANDY": 0, "HANDY_SIZE": 0}
         self.cargos: List[Dict] = []
         self.cargo_remaining_volume: Dict[str, float] = {}
         
@@ -1546,7 +1546,7 @@ class Simulator:
                     "Discharge Duration (hours)": f"{discharge_duration_hours:.2f}",
                     "Total Volume Discharged (bbl)": f"{actual_volume:,.0f}",
                     "Tanks Filled": f"{tanks_filled:.2f}",
-                    "Tank Fill Details": " | ".join([f"{d['Tank']}: {d['Tank']}: {d['Fill Start Date']} {d['Fill Start Time']}-{d['Fill End Date']} {d['Fill End Time']} ({d['Volume (bbl)']} bbl)" for d in fill_details])
+                    "Tank Fill Details": " | ".join([f"{d['Tank']}: {d['Fill Start Date']} {d['Fill Start Time']}-{d['Fill End Date']} {d['Fill End Time']} ({d['Volume (bbl)']} bbl)" for d in fill_details])
                 }
                 self.cargo_report_rows.append(row)
 

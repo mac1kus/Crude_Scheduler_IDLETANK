@@ -164,6 +164,27 @@
             <p><em>Optimization will consider both capacity and chartering costs</em></p>
             
             <div class="input-row">
+                <label>ULCC Capacity:</label>
+                <input type="number" id="ulccCapacity" value="2800000" min="0" onchange="autoSaveInputs()">
+                <span>bbl (0 = not available)</span>
+            </div>
+            <div class="input-row">
+                <label style="font-weight: bold; color: #d63384;">Minimum ULCCs Required:</label>
+                <input type="number" id="minUlccRequired" value="0" min="0" step="1" onchange="autoSaveInputs()">
+                <span>(Forces solver to start with these)</span>
+            </div>
+            <div class="input-row">
+                <label>ULCC Chartering Rate:</label>
+                <input type="number" id="ulccRateDay" value="55000" min="0" step="1000" onchange="autoSaveInputs()">
+                <span>$/day</span>
+            </div>
+            <div class="input-row">
+                <label>ULCC Include Return Journey:</label>
+                <input type="checkbox" id="ulccIncludeReturn" checked onchange="autoSaveInputs()">
+                <span>Include return journey in charter cost</span>
+            </div>
+
+            <div class="input-row">
                 <label>VLCC Capacity:</label>
                 <input type="number" id="vlccCapacity" value="2000000" min="0" onchange="autoSaveInputs()">
                 <span>bbl (0 = not available)</span>
@@ -247,8 +268,24 @@
                 <input type="checkbox" id="handymaxIncludeReturn" checked onchange="autoSaveInputs()">
                 <span>Include return journey in charter cost</span>
             </div>
+
+            <div class="input-row">
+                <label>Handy Size Capacity:</label>
+                <input type="number" id="handySizeCapacity" value="200000" min="0" onchange="autoSaveInputs()">
+                <span>bbl (0 = not available)</span>
+            </div>
+            <div class="input-row">
+                <label>Handy Size Chartering Rate:</label>
+                <input type="number" id="handySizeRateDay" value="8000" min="0" step="500" onchange="autoSaveInputs()">
+                <span>$/day</span>
+            </div>
+            <div class="input-row">
+                <label>Handy Size Include Return Journey:</label>
+                <input type="checkbox" id="handySizeIncludeReturn" checked onchange="autoSaveInputs()">
+                <span>Include return journey in charter cost</span>
+            </div>
             
-            <p><em>Priority: VLCC → Suezmax → Aframax → Panamax → Handymax (Set capacity to 0 to disable)</em></p>
+            <p><em>Priority: ULCC → VLCC → Suezmax → Aframax → Panamax → Handymax → Handy Size (Set capacity to 0 to disable)</em></p>
             <p><em>Note: Return journey inclusion is configurable per vessel type. Charter Period = Journey + Pre-Discharge + Pumping + Return (if checked)</em></p>
         </div>
 

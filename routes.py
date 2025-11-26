@@ -1511,11 +1511,13 @@ def register_routes(app):
                     "snapshot_interval_minutes": safe_int(params.get('snapshotIntervalMinutes', 30), 30, 'snapshotIntervalMinutes'),
                     
                     "cargo_defs": {
+                        "ULCC": safe_float(params.get('ulccCapacity', 0), 0, 'ulccCapacity'),
                         "VLCC": safe_float(params.get('vlccCapacity', 0), 0, 'vlccCapacity'),
                         "SUEZ": safe_float(params.get('suezmaxCapacity', 0), 0, 'suezmaxCapacity'),
                         "AFRA": safe_float(params.get('aframaxCapacity', 0), 0, 'aframaxCapacity'),
                         "PANA": safe_float(params.get('panamaxCapacity', 0), 0, 'panamaxCapacity'),
                         "HANDY": safe_float(params.get('handymaxCapacity', 0), 0, 'handymaxCapacity'),
+                        "HANDY_SIZE": safe_float(params.get('handySizeCapacity', 0), 0, 'handySizeCapacity'),
                     },
                     "use_optimized_schedule": params.get('use_optimized_schedule', False),
                     "solver_results": params.get('solver_results', None),
