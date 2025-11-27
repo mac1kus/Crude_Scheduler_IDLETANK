@@ -1179,6 +1179,21 @@ async function runSimulation() {
                 };
             });
         }
+        // --- FIX START: Recalculate Total Processed from the corrected daily data ---
+        if (simulationData.simulation_data) {
+            const calculatedTotal = simulationData.simulation_data.reduce((sum, row) => sum + (row.processing || 0), 0);
+            
+            // Ensure metrics object exists
+            if (!simulationData.metrics) {
+                simulationData.metrics = {};
+            }
+            
+            // Overwrite the server's value with our accurate sum
+            simulationData.metrics.total_processed = calculatedTotal;
+            
+            console.log("Fixed Total Processed:", calculatedTotal);
+        }
+        // --- FIX END ---
 
         const optimizationSummary = currentResults ? currentResults.optimization_results : null;
         
