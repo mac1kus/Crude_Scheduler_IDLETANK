@@ -1259,6 +1259,8 @@ function downloadCSVs() {
 }
 
 function displayResults(data) {
+    console.log("Rendering Results...", data); 
+
     const now = new Date();
     const timestampElement = document.getElementById('reportTimestamp');
     if (timestampElement) {
@@ -1266,43 +1268,37 @@ function displayResults(data) {
     }
    
     const metricsContainer = document.getElementById('metricsContainer');
-    metricsContainer.innerHTML = '<h3> Performance Metrics</h3>';
-
-    if (data.metrics) {
-        const metricsDiv = document.createElement('div');
-        metricsDiv.className = 'metrics-grid';
-        const processingEfficiency = data.metrics.processing_efficiency ? data.metrics.processing_efficiency.toFixed(1) : 'N/A';
-        const avgUtilization = data.metrics.avg_utilization ? data.metrics.avg_utilization.toFixed(1) : 'N/A';
-
-        metricsDiv.innerHTML = `
-            <div class="metric-card">
-                <h4>Processing Efficiency</h4>
-                <p class="metric-value">${processingEfficiency}%</p>
-            </div>
-            <div class="metric-card">
-                <h4>Total Processed</h4>
-                <p class="metric-value">${data.metrics.total_processed ? data.metrics.total_processed.toLocaleString() : 'N/A'} bbl</p>
-            </div>
-            <div class="metric-card">
-                <h4>Critical Days</h4>
-                <p class="metric-value">${data.metrics.critical_days} days</p>
-            </div>
-            <div class="metric-card">
-                <h4>Tank Utilization</h4>
-                <p class="metric-value">${avgUtilization}%</p>
-            </div>
-            <div class="metric-card">
-                <h4>Clash Days</h4>
-                <p class="metric-value">${data.metrics.clash_days} days</p>
-            </div>
-            <div class="metric-card">
-                <h4>Sustainable</h4>
-                <p class="metric-value">${data.metrics.sustainable_processing ? '✅ Yes' : '❌ No'}</p>
-            </div>
-        `;
-        metricsContainer.appendChild(metricsDiv);
+    if (!metricsContainer) {
+        console.error("ERROR: metricsContainer div not found in HTML");
+        return;
     }
 
+    // Clear previous results
+    metricsContainer.innerHTML = '<h3>📊 Performance Metrics</h3>';
+
+    // Ensure metrics object exists
+    const metrics = data.metrics || {};
+    
+    // Create the grid container
+    const metricsDiv = document.createElement('div');
+    metricsDiv.className = 'metrics-grid';
+
+    // Helper to safely format numbers
+    const safeFormat = (val) => val !== undefined && val !== null ? Math.round(val).toLocaleString() : '0';
+
+    // --- ONLY SHOW TOTAL PROCESSED (Other cards removed as requested) ---
+    metricsDiv.innerHTML += `
+        <div class="metric-card" style="border-left: 5px solid #007bff; background-color: #f8f9fa;">
+            <h4 style="color: #007bff; font-weight: bold;">TOTAL PROCESSED</h4>
+            <p class="metric-value" style="font-size: 1.5em;">${safeFormat(metrics.total_processed)} bbl</p>
+            <div class="metric-label">Total crude run</div>
+        </div>
+    `;
+
+    // Add the grid to the container
+    metricsContainer.appendChild(metricsDiv);
+
+    // Render other sections
     if (data.simulation_log) {
         displaySimulationLog(data);
     }
